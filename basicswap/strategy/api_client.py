@@ -71,6 +71,16 @@ class BasicSwapClient:
                 raw = resp.read().decode("utf-8")
         except urllib.error.URLError as e:
             raise BasicSwapAPIError(f"request to {url} failed: {e}") from e
+        except TimeoutError as e:
+            # A timeout during urlopen() itself surfaces as urllib.error.URLError
+            # (caught above), already wrapping a TimeoutError as its .reason — but
+            # a timeout during resp.read() (the response headers arrived, the body
+            # didn't in time) raises a bare TimeoutError straight from the socket
+            # layer, past urllib entirely. Found via a real incident 2026-09-18:
+            # this crashed the whole live_maker loop instead of being treated as
+            # the same "one API call failed, real caller decides what to do"
+            # network failure every other BasicSwapAPIError already represents.
+            raise BasicSwapAPIError(f"request to {url} timed out: {e}") from e
 
         try:
             parsed = json.loads(raw)

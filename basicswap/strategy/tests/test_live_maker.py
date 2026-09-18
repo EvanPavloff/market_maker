@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from .. import storage
+from ..api_client import BasicSwapAPIError
 from ..external_rates import ReferenceRate
 from ..live_maker import (
     AmbiguousLiveOffersError,
@@ -228,6 +229,16 @@ class ResolveAmountFromTests(unittest.TestCase):
         cfg = _cfg(amount_from=None, reserve_usd=210.0, coin_from="xmr", coin_to="btc", side="bid")
         self.assertIsNone(_resolve_amount_from(self.client, cfg))
 
+    @patch("strategy.live_maker.external_rates.get_usd_price")
+    def test_wallet_balance_failure_returns_none_rather_than_raising(self, mock_usd_price):
+        # Real incident 2026-09-18: this exact call (get_wallet_balance inside
+        # _resolve_amount_from, not decide_and_act) was the one uncaught path
+        # that crashed the whole bid-side loop on a transient timeout.
+        mock_usd_price.return_value = 510.68
+        self.client.get_wallet_balance.side_effect = BasicSwapAPIError("request timed out")
+        cfg = _cfg(amount_from=None, reserve_usd=210.0, coin_from="xmr", coin_to="btc", side="bid")
+        self.assertIsNone(_resolve_amount_from(self.client, cfg))
+
 
 def _rate(**overrides) -> ReferenceRate:
     defaults = dict(
@@ -294,6 +305,72 @@ class RunCycleKillSwitchTests(unittest.TestCase):
         mock_rate.return_value = _rate(coingecko_rate=154.0)
 
         run_cycle(self.client, self.conn, _cfg(), monitor)
+
+        self.client.revoke_offer.assert_not_called()
+        self.client.post_offer.assert_not_called()
+
+
+class RunCycleSourceDisagreementTests(unittest.TestCase):
+    """market_maker/next_steps.md #10 — closes the real 2026-09-18 incident
+    where a single bad CoinGecko reading (undetected by the volatility
+    kill-switch, since it only sees trouble in the trailing window) priced a
+    real ask ~6.7% below fair value. run_cycle now checks CoinGecko vs.
+    Kraken agreement on the reading itself, before ever using it."""
+
+    def setUp(self):
+        self.conn = storage.connect(":memory:")
+        self.client = MagicMock()
+        self.client.get_wallet_balance.return_value = 1.0
+        self.client.get_sent_offers.return_value = []
+        self.client.post_offer.return_value = "aaaa"
+        self.monitor = VolatilityMonitor(window_seconds=900)
+
+    @patch("strategy.live_maker.external_rates.get_reference_rate")
+    def test_large_disagreement_skips_the_cycle_entirely(self, mock_rate):
+        # coingecko=136.17 vs kraken=145.0 -> ~6.2% disagreement, well past
+        # the 1.5% default threshold — this is the shape of the real incident.
+        mock_rate.return_value = _rate(coingecko_rate=136.17, kraken_rate=145.0, disagreement_pct=0.062)
+
+        run_cycle(self.client, self.conn, _cfg(), self.monitor)
+
+        self.client.post_offer.assert_not_called()
+        self.client.revoke_offer.assert_not_called()
+
+    @patch("strategy.live_maker.external_rates.get_reference_rate")
+    def test_large_disagreement_does_not_poison_the_volatility_window(self, mock_rate):
+        mock_rate.return_value = _rate(coingecko_rate=136.17, kraken_rate=145.0, disagreement_pct=0.062)
+
+        run_cycle(self.client, self.conn, _cfg(), self.monitor)
+
+        self.assertEqual(len(self.monitor._samples), 0)
+
+    @patch("strategy.live_maker.external_rates.get_reference_rate")
+    def test_small_disagreement_does_not_trigger_the_gate(self, mock_rate):
+        mock_rate.return_value = _rate(coingecko_rate=150.0, kraken_rate=150.3, disagreement_pct=0.002)
+
+        run_cycle(self.client, self.conn, _cfg(), self.monitor)
+
+        self.client.post_offer.assert_called_once()
+
+    @patch("strategy.live_maker.external_rates.get_reference_rate")
+    def test_no_kraken_coverage_proceeds_on_coingecko_alone(self, mock_rate):
+        # Most BasicSwap pairs have no Kraken cross-check at all —
+        # disagreement_pct is None, not zero, and must not block quoting.
+        mock_rate.return_value = _rate(coingecko_rate=150.0, kraken_rate=None, disagreement_pct=None)
+
+        run_cycle(self.client, self.conn, _cfg(), self.monitor)
+
+        self.client.post_offer.assert_called_once()
+
+    @patch("strategy.live_maker.external_rates.get_reference_rate")
+    def test_large_disagreement_leaves_an_existing_live_offer_untouched(self, mock_rate):
+        self.client.get_sent_offers.return_value = [
+            {"offer_id": "aaaa", "rate": "150.99000000", "created_at": time.time(),
+             "is_expired": False, "is_revoked": False}
+        ]
+        mock_rate.return_value = _rate(coingecko_rate=136.17, kraken_rate=145.0, disagreement_pct=0.062)
+
+        run_cycle(self.client, self.conn, _cfg(), self.monitor)
 
         self.client.revoke_offer.assert_not_called()
         self.client.post_offer.assert_not_called()

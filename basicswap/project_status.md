@@ -704,3 +704,198 @@ repeat of the 2026-09-17 orphaned-duplicate bug), both startup log lines show
 the new kill-switch settings, and `/json/sentoffers` confirmed the ask side's
 one live offer survived the restart untouched. Bid side unaffected — still
 under its $210 reserve, as it's been all day.
+
+## 2026-09-18, later same day: duplicate-instance PID guard built and deployed (`../next_steps.md` #9)
+
+Full design/rollout logged at the framework level in `../project_status.md`'s
+matching entries (not duplicated here). Short version: `run_live_maker.sh`
+now `exec`s `python3` instead of running it as a child process — closing the
+actual mechanism behind the 2026-09-17 orphaned-duplicate incident, not just
+a PID file layered on top of it — and refuses to start if a lock file points
+at a still-alive `strategy.live_maker` process for that side/pair. Deployed
+same day: both loops restarted (old PIDs 76467/76468 → new 1894/1895),
+verified exactly 2 processes with no separate wrapper shell this time.
+
+## 2026-09-18, later still: first real fill of the *automated* offer, in progress as of this check
+
+Distinct from the 2026-09-17 test swap (which was Evan manually bidding
+*into* someone else's live offer to exercise the mechanism) — this is a real
+counterparty bidding into **our own live_maker-posted ask offer**
+(`000000006aad65d120f29f0bab44d706846836375a752eb8b5867618`, 0.008 BTC for
+~1.089 XMR, rate 136.1696), the first evidence the automated loop itself has
+actually attracted and started filling a real trade, not just proven the
+swap mechanism works.
+
+Found while checking `next_steps.md` #3/#4's fill-count gate (not something
+that alerted proactively — this project has no fill-detection yet, that's
+exactly #4's gap): `basicswap_live_maker.log` logged `wallet has 0.00057685
+BTC, need 0.00800000 to post this quote — not posting/revoking. This is
+expected once the live offer has actually been filled` at 12:44:50 — correct,
+designed-for behavior, not a bug. Cross-checked against `/json/bids` and
+`basicswap.log` directly: bid `000000006aad6738cffa3f91108af3639330b9ad29e11e0fb543d7c6`
+was accepted 12:33:16, our BTC lock tx confirmed on-chain 12:33:49, and the
+swap reached `BidStates.XMR_SWAP_SCRIPT_COIN_LOCKED` (state 9) at 12:47:37 —
+**still in that state as of the last check (12:50:37), not yet
+`SWAP_COMPLETED` (state 8)**. Consistent with the 2026-09-17 test swap's
+40-minute acceptance-to-completion time (Monero confirmation latency
+dominates); did not wait around for it to finish. **A fresh session picking
+this up should re-check `curl -s http://localhost:12700/json/bids` and
+`grep <bid_id> ~/coinswaps/basicswap.log | tail` before treating this as
+either completed or stalled** — if `bid_state` has moved to something other
+than "Script coin locked" (a completed-looking state, or one of the
+`XMR_SWAP_FAILED_*`/`SWAP_TIMEDOUT` states), that's new information neither
+this entry nor `../next_steps.md` account for yet.
+
+**No action taken beyond read-only checks** — did not touch the live
+processes, offers, or wallet. If this completes normally, it's the second
+real fill this project has ever had (after 2026-09-17's), which materially
+strengthens the case that `../next_steps.md` #4 (fill-vs-expiry detection)
+is close to its "one more real fill" unblock condition — see that file's
+updated framing.
+
+**Update, ~15 min later (still same session)**: progressed normally, not
+stalled — `bid_state` now reads "Script coin lock released"
+(`BidStates.XMR_SWAP_LOCK_RELEASED`, state 12, reached 12:52:37), one step
+past where it was at the last check. `basicswap.log` shows this as an
+ordinary swap-completion sequence (`Releasing ads script coin lock tx...`,
+`Sending bid secret...`) — no error/failed/timeout state at any point so
+far. Still not `SWAP_COMPLETED` (state 8) as of this check. A fresh session
+should still re-verify current state before assuming completion.
+
+## 2026-09-18, later still: the fill completed — and was mispriced ~6.7% below fair value (real loss, root-caused, fix built)
+
+Confirmed `Completed` shortly after the update above. Evan then asked "This
+looks like I'm losing money, no?" while looking at the trade
+(0.00800000 BTC → 1.089356406320 XMR) — correct call. Full reconstruction:
+
+**The math**: 0.008 BTC for 1.089356406320 XMR is a rate of 136.1695 XMR/BTC.
+`poller.py`'s own independent CoinGecko readings, on its own concurrent
+5-minute cadence, held a tight 144.9–145.6 XMR/BTC band through the whole
+surrounding window (11:50 through 12:35, no comparable dip at any point) —
+current live prices (BTC $80,775 / XMR $558.93 at time of checking) put the
+cross rate at 144.5 XMR/BTC too, consistent with the same range. With the
+configured 0.66% ask spread, the offer should have posted around ~146
+XMR/BTC. It posted at 136.17 — **about 6.7% below fair value**, roughly
+0.079 XMR (~$45–50 at prices near the time of the fill) less than a
+correctly-priced offer would have gotten for the same 0.008 BTC.
+
+**Where the bad number came from**: the ask log shows the reprice history
+that morning was all small, sane moves (146.53 → 144.11 → 143.10), then one
+cycle jumped 143.10 → 136.17 (`drift=4.845%`, logged 12:24:49) — the exact
+cycle that then got bid into a few minutes later. `poller.py`'s own
+`direct_rate_snapshots` table (same `external_rates.get_reference_rate()`
+function, independent call, offset polling cadence) shows `disagreement_pct`
+between CoinGecko and Kraken staying completely normal (0.03%–0.47%)
+throughout this whole window — meaning Kraken was available and agreeing
+with CoinGecko the entire time, just never consulted by `live_maker.py`
+before using the reading to price a real offer. The most likely explanation:
+a transient bad/stale response from CoinGecko specific to that one
+`live_maker` API call (not a real market move — nothing else corroborates a
+7% swing in 25 minutes, and the pair's own real volatility calibration
+(`volatility.py`, 512 samples) puts a 15-minute p99 at 0.84%, max ever
+observed 1.10%).
+
+**Why the volatility kill-switch (next_steps.md #1) didn't catch it**: that
+control only measures the *trailing* effect of a bad reading already sitting
+in its rolling window — it fired on the cycles *after* this one (11:39
+through 12:19 show escalating kill-switch warnings as the window's range
+grew), but by the time it could react, the bad post had already happened and
+already been bid into. It's a real, separate design limitation from what
+caused the bad reading itself.
+
+**Fix built** (`../next_steps.md` #10, full detail there):
+`live_maker.run_cycle` now checks `disagreement_pct` — already computed by
+`get_reference_rate()`, just never read — before ever using the reference
+rate, and skips the cycle (not feeding the bad reading into the volatility
+monitor either) if CoinGecko and Kraken disagree beyond a
+real-data-calibrated 1.5% threshold. 5 new tests, 95/95 total passing. **Not
+yet deployed to the live processes as of this entry** — see below.
+
+**Also found while checking on the live processes to plan this deploy**: the
+bid-side loop (PID 1895) had crashed — an uncaught `TimeoutError` from
+`get_wallet_balance` (a plain socket read timeout against BasicSwap's own
+API, not an external-rate issue) sometime after its last log line at
+13:04:52. `run_cycle` already catches `ExternalRateError`,
+`InsufficientBalanceError`, and `BasicSwapAPIError` around the pieces of a
+cycle that can fail — the wallet-balance call inside `_resolve_amount_from`
+isn't wrapped the same way, so a transient network hiccup against
+BasicSwap's own local API took the whole loop down instead of just skipping
+a cycle. No funds were at risk (the bid side had no live offer up when it
+crashed, per the last log lines before the crash), but the loop has been
+down since ~13:09 doing nothing. Not fixed yet — flagged for the same
+restart/deploy conversation as #10, since a plain restart brings it back but
+doesn't prevent the next transient timeout from killing it again.
+
+## 2026-09-18, later still: both fixes built, tested, and deployed
+
+Evan confirmed: fix #10, and also fix the bid-side crash and restart both.
+
+**Crash root cause, pinned down exactly**: `strategy/api_client.py`'s
+`_request` only wraps `urllib.error.URLError` as `BasicSwapAPIError`. A
+timeout during `urlopen()` itself does raise `URLError` (already handled) —
+but a timeout during `resp.read()` (the response headers arrived, the body
+didn't in time) raises a bare `TimeoutError` straight from the socket layer,
+which `urllib` never wraps at all. That's exactly what the traceback showed:
+`get_wallet_balance` → `_post` → `_request` → `resp.read()` →
+`socket.recv_into` → `TimeoutError`, propagating all the way up through
+`_resolve_amount_from` (called in `run_cycle` *before* the
+`decide_and_act`/`try`/`except InsufficientBalanceError, BasicSwapAPIError`
+block that would have caught it if it had been wrapped correctly) and
+killing the whole loop.
+
+**Fixed at both layers**:
+- `api_client.py`'s `_request` now also catches `TimeoutError` and wraps it
+  as `BasicSwapAPIError`, matching that class's own documented contract
+  ("raised on a network failure...") — this protects every caller
+  (`get_offers`, `get_wallet_balance`, `post_offer`, `revoke_offer`), not
+  just this one call site.
+- `live_maker.py`'s `_resolve_amount_from` now wraps its
+  `client.get_wallet_balance(...)` call in its own try/except for
+  `BasicSwapAPIError`, logging a warning and returning `None` (skip this
+  cycle) — the exact same pattern the function already used one line above
+  it for `get_usd_price` failures. The other `get_wallet_balance` call site
+  (`decide_and_act`'s `_check_funded`) didn't need a matching fix — it was
+  already inside the try/except that catches `BasicSwapAPIError`, so it was
+  only ever exposed to this bug via the unwrapped-`TimeoutError` gap in
+  `api_client.py`, now closed.
+
+**Tested**: 1 new test in `test_api_client.py` (a `TimeoutError` during
+`resp.read()` raises `BasicSwapAPIError`), 2 new tests in `test_live_maker.py`
+(`_resolve_amount_from` returns `None` rather than raising when
+`get_wallet_balance` fails). **Combined with #10's 5 tests: 97/97 passing**
+(was 90 before either fix).
+
+**Deployed, on Evan's go-ahead**: `kill -TERM` on the ask process (PID 1894
+— the bid side was already down from the crash, nothing to kill there),
+relaunched both via the same `nohup ./run_live_maker.sh --loop ...`
+invocations into the same log files. New PIDs 33177 (ask) / 33178 (bid).
+
+**Verified clean**: exactly 2 processes, `ps aux | grep run_live_maker.sh`
+confirms no separate wrapper shell (the #9 duplicate-instance guard's `exec`
+still working through this restart too), both startup log lines show
+`max_source_disagreement_pct=0.0150` confirming the new gate is live, and —
+the most direct proof the crash fix actually works, not just that tests
+pass — **the bid side immediately posted a real fresh offer** (1.092572670000
+XMR, funded by the XMR received from the earlier fill pushing the wallet
+back above the $210 reserve line) on its very first cycle after restart,
+something it could not have done while crashed.
+
+**Two things this surfaced that are NOT fixed, logged in the outer
+workspace's `TASKS.md` instead of here since they need a human decision**:
+1. The ask wallet now has only 0.00057685 BTC (below the 0.008 the offer
+   quotes) — `live_maker.py` correctly refuses to post/revoke without
+   enough funds, so the ask side is just idle until either more BTC arrives
+   or `--amount-from` is lowered to match reality.
+2. The offer that started this whole investigation
+   (`000000006aad65d120f29f0bab44d706846836375a752eb8b5867618`, still
+   quoting the stale 136.17 XMR/BTC rate) is **still listed as active** on
+   BasicSwap's own book (`curl -s http://localhost:12700/json/sentoffers`
+   confirms it, right alongside the new bid offer). `live_maker.py`
+   deliberately never revokes an offer it can't afford to replace — sound
+   logic for a reprice that shouldn't leave nothing live, but this offer is
+   permanently unfundable at current balance, not temporarily stale, and
+   that distinction isn't handled. A real counterparty bidding on it would
+   likely just fail at the coin-locking step rather than lose anyone money,
+   but it's a stale, wrong price sitting on a real public order book.
+   Revoking it is one `client.revoke_offer()` call away — not done
+   unprompted since it's a real action against live infrastructure.

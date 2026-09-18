@@ -42,6 +42,20 @@ class BasicSwapClientTests(unittest.TestCase):
             self.client.get_rate("xmr", "btc")
 
     @patch("strategy.api_client.urllib.request.urlopen")
+    def test_timeout_during_response_read_raises_basicswap_api_error(self, mock_urlopen):
+        # Real incident 2026-09-18: a timeout during resp.read() (headers
+        # arrived, body didn't in time) is a bare TimeoutError from the socket
+        # layer, not a urllib.error.URLError — it crashed live_maker's bid loop
+        # because this was previously uncaught here.
+        resp = MagicMock()
+        resp.read.side_effect = TimeoutError("timed out")
+        resp.__enter__.return_value = resp
+        resp.__exit__.return_value = False
+        mock_urlopen.return_value = resp
+        with self.assertRaises(BasicSwapAPIError):
+            self.client.get_wallet_balance("btc")
+
+    @patch("strategy.api_client.urllib.request.urlopen")
     def test_basic_auth_header_set_when_password_given(self, mock_urlopen):
         mock_urlopen.return_value = _fake_response({"rate": "0.005"})
         authed_client = BasicSwapClient(

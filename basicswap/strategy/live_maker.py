@@ -35,6 +35,30 @@ Safety notes:
     own drift-based repricing doesn't cover: reprice chases a moved price
     after the fact every cycle; the kill-switch instead pauses quoting into a
     market that's still actively moving.
+  - Source-disagreement gate (market_maker/next_steps.md #10, built 2026-09-18,
+    real incident): the volatility kill-switch only sees trouble *after* a bad
+    reference_mid is already in its rolling window — it did not stop the real
+    2026-09-18 12:24 ask repost that priced 0.008 BTC at 136.17 XMR/BTC, ~6.7%
+    below the ~145 XMR/BTC both CoinGecko and Kraken were independently
+    showing within a minute of that exact post (see project_status.md's
+    matching entry for the full reconstruction — the bad number was isolated
+    to that one live_maker API call, not a real market move or a systemic
+    CoinGecko issue). external_rates.get_reference_rate() already computes an
+    independent Kraken cross-check and a disagreement_pct between it and
+    CoinGecko on every call, for every pair with Kraken coverage — this was
+    simply never read before using reference_mid. run_cycle now skips
+    posting/reposting for a cycle (existing offer left untouched, same
+    posture as every other guard here) when disagreement_pct is available and
+    exceeds cfg.max_source_disagreement_pct — an independent check on the
+    input itself, not on its trailing volatility, so a single bad read gets
+    caught on the very cycle it happens rather than only in the noise it
+    leaves behind. When no Kraken pair is configured for a given coin pair
+    (most of BasicSwap's supported coins aren't listed on Kraken —
+    external_rates._KRAKEN_PAIRS only covers xmr/btc and ltc/btc today),
+    disagreement_pct is None and this check is a no-op — there's no
+    independent source to disagree with, so run_cycle proceeds on CoinGecko
+    alone exactly as before, rather than refusing to quote pairs that simply
+    have no cross-check available.
 """
 
 import argparse
@@ -73,6 +97,7 @@ class LiveMakerConfig:
     automation_strat_id: int | None = 1
     kill_switch_window_minutes: float = 15.0  # rolling window volatility.VolatilityMonitor evaluates
     kill_switch_volatility_pct: float = 0.0085  # see volatility.py's module docstring for calibration
+    max_source_disagreement_pct: float = 0.015  # see run_cycle's docstring note below for calibration
 
     def __post_init__(self):
         has_fixed = self.amount_from is not None
@@ -226,7 +251,16 @@ def _resolve_amount_from(client: BasicSwapClient, cfg: LiveMakerConfig) -> float
     except ExternalRateError as e:
         log.warning("get_usd_price(%s) failed, skipping this cycle: %s", cfg.coin_from, e)
         return None
-    available = client.get_wallet_balance(cfg.coin_from)
+    try:
+        available = client.get_wallet_balance(cfg.coin_from)
+    except BasicSwapAPIError as e:
+        # Real incident 2026-09-18: an uncaught TimeoutError here (before
+        # api_client.py wrapped it as BasicSwapAPIError, see that module's
+        # matching fix) crashed the whole bid-side loop rather than just
+        # skipping a cycle like every other transient failure in this
+        # function already does.
+        log.warning("get_wallet_balance(%s) failed, skipping this cycle: %s", cfg.coin_from, e)
+        return None
     reserve_coin = cfg.reserve_usd / usd_price
     dynamic_amount = available - reserve_coin
     if dynamic_amount <= 0:
@@ -250,6 +284,17 @@ def run_cycle(
     reference_mid = rate.coingecko_rate if rate.coingecko_rate is not None else rate.kraken_rate
     if reference_mid is None:
         log.warning("no usable reference rate for %s/%s this cycle, skipping", cfg.coin_from, cfg.coin_to)
+        return
+
+    if rate.disagreement_pct is not None and rate.disagreement_pct > cfg.max_source_disagreement_pct:
+        log.warning(
+            "%s/%s %s: CoinGecko/Kraken disagree by %.3f%% (coingecko=%s kraken=%s), exceeds "
+            "%.3f%% threshold — skipping post/reprice this cycle, any existing live offer is "
+            "left untouched. Not feeding this reading into the volatility window either, since "
+            "it's already flagged unreliable.",
+            cfg.coin_from, cfg.coin_to, cfg.side, rate.disagreement_pct * 100,
+            rate.coingecko_rate, rate.kraken_rate, cfg.max_source_disagreement_pct * 100,
+        )
         return
 
     now = time.time()
@@ -297,11 +342,12 @@ def run(cfg: LiveMakerConfig, loop: bool) -> None:
     log.info(
         "LIVE market-making: %s/%s %s, %s half_spread_pct=%.4f "
         "reprice_threshold_pct=%.4f offer_valid_hours=%.2f lock_hours=%.1f valid_hours=%.1f "
-        "automation_strat_id=%s kill_switch_window_minutes=%.1f kill_switch_volatility_pct=%.4f db=%s",
+        "automation_strat_id=%s kill_switch_window_minutes=%.1f kill_switch_volatility_pct=%.4f "
+        "max_source_disagreement_pct=%.4f db=%s",
         cfg.coin_from, cfg.coin_to, cfg.side, sizing, cfg.half_spread_pct,
         cfg.reprice_threshold_pct, cfg.offer_valid_hours, cfg.lock_hours, cfg.valid_hours,
         cfg.automation_strat_id, cfg.kill_switch_window_minutes, cfg.kill_switch_volatility_pct,
-        config.db_path,
+        cfg.max_source_disagreement_pct, config.db_path,
     )
 
     try:
@@ -354,6 +400,13 @@ def main(argv: list[str] | None = None) -> int:
         help="(max-min)/mean over the window above which posting/reposting is skipped for "
         "that cycle; default calibrated from real poller history, see volatility.py",
     )
+    parser.add_argument(
+        "--max-source-disagreement-pct", type=float, default=0.015,
+        help="skip posting/reposting for a cycle if CoinGecko and Kraken disagree on the "
+        "reference rate by more than this (when both are available for the pair) — see "
+        "live_maker.py's module docstring for the real 2026-09-18 incident this closes and "
+        "real poller-history calibration (p99=0.96%%, max=1.45%% over 559 samples).",
+    )
     args = parser.parse_args(argv)
 
     if not args.live:
@@ -381,6 +434,7 @@ def main(argv: list[str] | None = None) -> int:
         automation_strat_id=args.automation_strat_id,
         kill_switch_window_minutes=args.kill_switch_window_minutes,
         kill_switch_volatility_pct=args.kill_switch_volatility_pct,
+        max_source_disagreement_pct=args.max_source_disagreement_pct,
     )
     try:
         run(cfg, loop=args.loop)
