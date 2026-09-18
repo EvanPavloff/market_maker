@@ -1,0 +1,18 @@
+[
+  {
+    "swap_type": "xmr_swap",
+    "offer_id": "bb11",
+    "created_at": 1000,
+    "expire_at": 2000,
+    "coin_from": "Bitcoin",
+    "coin_to": "Monero",
+    "amount_from": "1.00000000",
+    "amount_to": "192.30769231",
+    "rate": "192.30769231",
+    "min_bid_amount": "0.10000000",
+    "is_expired": false,
+    "is_own_offer": false,
+    "is_revoked": false,
+    "is_public": true
+  }
+]

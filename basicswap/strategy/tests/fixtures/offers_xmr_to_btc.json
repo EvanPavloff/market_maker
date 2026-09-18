@@ -1,0 +1,50 @@
+[
+  {
+    "swap_type": "xmr_swap",
+    "offer_id": "aa11",
+    "created_at": 1000,
+    "expire_at": 2000,
+    "coin_from": "Monero",
+    "coin_to": "Bitcoin",
+    "amount_from": "10.00000000",
+    "amount_to": "0.05500000",
+    "rate": "0.00550000",
+    "min_bid_amount": "1.00000000",
+    "is_expired": false,
+    "is_own_offer": false,
+    "is_revoked": false,
+    "is_public": true
+  },
+  {
+    "swap_type": "xmr_swap",
+    "offer_id": "aa22",
+    "created_at": 1000,
+    "expire_at": 2000,
+    "coin_from": "Monero",
+    "coin_to": "Bitcoin",
+    "amount_from": "5.00000000",
+    "amount_to": "0.02850000",
+    "rate": "0.00570000",
+    "min_bid_amount": "1.00000000",
+    "is_expired": false,
+    "is_own_offer": false,
+    "is_revoked": false,
+    "is_public": true
+  },
+  {
+    "swap_type": "xmr_swap",
+    "offer_id": "aa33-revoked",
+    "created_at": 900,
+    "expire_at": 1900,
+    "coin_from": "Monero",
+    "coin_to": "Bitcoin",
+    "amount_from": "50.00000000",
+    "amount_to": "0.10000000",
+    "rate": "0.00200000",
+    "min_bid_amount": "1.00000000",
+    "is_expired": false,
+    "is_own_offer": false,
+    "is_revoked": true,
+    "is_public": true
+  }
+]
