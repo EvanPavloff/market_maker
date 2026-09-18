@@ -1,7 +1,8 @@
 # Market Maker — Project Status
 
-**Status as of 2026-09-17 (updated later the same day): one live venue
-(BasicSwap), real money, real fills, now with its own GitHub repo.**
+**Status as of 2026-09-18: one live venue (BasicSwap), real money, real
+fills, now with its own GitHub repo, plus a volatility kill-switch built and
+deployed to both live loops the same day (see the dated entry below).**
 Framework-level docs (this file, `ARCHITECTURE.md`, `next_steps.md`) created
 today by reviewing `btc_xmr_market_making_framework_v3.1.pdf` and
 `kyc_resilience_mvb_v3.pdf` against the venue-level project's actual state —
@@ -145,11 +146,54 @@ buffered output can still be the last bytes in the file. Prefer `grep`ing for
 the process's own known log-message pattern plus a timestamp check, or a
 stack sample, over trusting raw `tail` order.
 
+## 2026-09-18: volatility kill-switch built (`next_steps.md` #1)
+
+Closed the one risk control from `ARCHITECTURE.md` §6 with zero built
+equivalent: `basicswap/strategy/volatility.py`'s new `VolatilityMonitor` gives
+`live_maker.py`'s `run_cycle` a rolling window of reference-mid samples (reuses
+the same `external_rates.get_reference_rate()` call already made every cycle
+— no new polling) and skips `decide_and_act` for that cycle — any existing
+live offer left untouched — when the window's `(max-min)/mean` move exceeds a
+threshold. Threshold isn't a guess: pulled 512 real `direct_rate_snapshots`
+rows (~42.6h of `basicswap/strategy/poller.py`'s own observation-window
+history for Monero/Bitcoin, spanning 2026-09-16 through this morning) directly
+from `~/coinswaps/basicswap_observations.db` and computed the real 15-minute
+rolling-range distribution: p50=0.22%, p90=0.49%, p95=0.63%, p99=0.84%,
+max=1.10%. Shipped default is 0.85% over a 15-minute window — just above the
+observed p99, so it only fires on moves more extreme than ~99% of this pair's
+real recent history, not on the routine drift `reprice_threshold_pct` (0.5%)
+already reprices through. Both are CLI flags
+(`--kill-switch-window-minutes`/`--kill-switch-volatility-pct`) for later
+re-calibration once the observation window has more history.
+
+14 new tests (`strategy/tests/test_volatility.py`'s 5 `VolatilityMonitor`
+unit tests + `test_live_maker.py`'s 4 new `RunCycleKillSwitchTests`, plus
+existing-signature updates); `python -m unittest discover -t . -s
+strategy/tests` is green at 90/90. No docs/tests touch real capital or key
+material — this only reads already-public rate history and edits pure Python
+decision logic.
+
+**Deployed same day, on Evan's go-ahead** ("no interest in my offers for many
+hours" — low risk of interrupting an in-progress negotiation): `kill -TERM`
+on both real python processes (old PIDs 49899 ask / 49900 bid — the wrapper
+shells then exited on their own once their foreground child was gone, no
+orphaned-child repeat of the 2026-09-17 duplicate-process bug), immediately
+relaunched via the same `nohup ./run_live_maker.sh --loop ...` invocations
+into the same log files. Verified clean: exactly 2 processes after restart
+(new PIDs 76467/76468 + wrappers), both startup log lines show
+`kill_switch_window_minutes=15.0 kill_switch_volatility_pct=0.0085`
+confirming the new code is what's actually running, and `/json/sentoffers`
+showed the ask side's one live offer survived the restart (a normal
+drift-triggered reprice happened moments later, unrelated to the
+kill-switch — the fresh process has no rolling-window history yet, so
+`volatility_pct()` correctly returned `None` rather than blocking anything on
+its first-ever cycle). Bid side unaffected throughout — still under its $210
+reserve.
+
 ## Next action
 
-See `next_steps.md` #1 (volatility kill-switch) — the single highest-value,
-lowest-effort gap between the source PDFs' risk-control table and what's
-actually running. Everything else on that list is either blocked on more real
-fill data accumulating (`basicswap/next_steps.md`'s observation window, still
-short of its 1–2 week bar) or deliberately gated behind the single-venue edge
+`next_steps.md` #9 (duplicate-instance PID guard — cheap, independent, no
+strategy risk) or #3/#4 (P&L ledger + fill detection), still gated on more
+real fill data accumulating. Everything else on that list remains blocked on
+the observation window clearing its 1–2 week bar or on the single-venue edge
 proving itself first.

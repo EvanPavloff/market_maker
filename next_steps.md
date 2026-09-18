@@ -10,7 +10,13 @@ not duplicated, unless this level changes their priority.
 `project_status.md`): priorities below are unchanged from this morning's
 version, with one addition (#9) found during that re-verification.
 
-## 1. Volatility-based kill-switch `[NOT STARTED]`
+**2026-09-18: #1 (volatility kill-switch) built and deployed to both live
+loops the same day**, on Evan's explicit go-ahead — see its entry below for
+the shipped design, real-data calibration, and restart verification. Next up
+per this ordering: #9 (cheap, independent, no strategy risk) or #3/#4 (P&L
+ledger + fill detection, still gated on more real fill data accumulating).
+
+## 1. Volatility-based kill-switch `[DONE 2026-09-18]`
 
 **Gap**: `ARCHITECTURE.md` §6 — the PDF's "pause quoting if reference volatility
 spikes" control doesn't exist. `live_maker.py` reprices on drift after the fact
@@ -19,21 +25,29 @@ during a fast move — it just chases the new price every 5 minutes, which is
 exactly the stale-quote-arbitrage exposure the PDF's kill-switch exists to
 prevent.
 
-**Why this is first**: it's the cheapest control to add (one new check in
-`decide_and_act()`, reusing the reference-rate history `external_rates.py`
-already pulls) and it's the one piece of §6's risk-control table with zero
-built equivalent, unlike UTXO hygiene (not applicable at this scale) or
-passive-first rebalancing (trivially true with one venue).
-
-**Concrete shape**: compute rolling N-minute volatility off
-`external_rates.get_reference_rate()`'s own polling cadence (already fetched
-every cycle for the mid price — no new API surface needed); if it exceeds a
-configurable threshold, skip posting/reposting for that cycle (log why) rather
-than revoking-and-reposting into a market that's still moving. Needs a
-threshold picked from real data — the observation window's poller history
-(`basicswap/strategy/poller.py`'s logged mid-prices) already has enough samples
-to compute a realistic baseline volatility distribution before picking a
-number, so this doesn't need to start from a guess.
+**Built**: `basicswap/strategy/volatility.py`'s new `VolatilityMonitor` — an
+in-memory rolling window of `(timestamp, reference_mid)` samples, fed by the
+same `external_rates.get_reference_rate()` call `run_cycle` already made every
+cycle (no new API surface). `run_cycle` now adds each cycle's mid to the
+monitor and, if the window's `(max-min)/mean` exceeds
+`cfg.kill_switch_volatility_pct`, skips `decide_and_act` entirely for that
+cycle (logs why; any existing live offer is left untouched — same "never
+destroy a working offer" posture as the existing insufficient-balance path).
+Threshold is real-data-calibrated, not guessed: computed 2026-09-18 against
+512 real `direct_rate_snapshots` samples (~42.6h of `basicswap/strategy/
+poller.py`'s own observation-window history for Monero/Bitcoin) — a 15-minute
+rolling range showed p50=0.22%, p90=0.49%, p95=0.63%, p99=0.84%, max=1.10%;
+the shipped default (0.85%, 15-minute window) sits just above that p99, so the
+kill-switch only fires on moves more extreme than ~99% of what this pair has
+actually done, not on the routine noise `reprice_threshold_pct` (0.5%) already
+handles. Both values are CLI flags (`--kill-switch-window-minutes`,
+`--kill-switch-volatility-pct`) if the calibration needs revisiting later. 14
+new tests (`test_volatility.py` + `test_live_maker.py`'s
+`RunCycleKillSwitchTests`), full suite green (90/90). **Deployed same day** —
+both live `run_live_maker.sh --loop` processes restarted and verified running
+the new code (startup log shows the kill-switch settings; the ask side's one
+live offer survived the restart untouched) — see `project_status.md`/
+`basicswap/project_status.md`.
 
 ## 2. Replace the hand-picked `--reserve-usd 210` with a real MVB calculation `[NOT STARTED, blocked on data]`
 

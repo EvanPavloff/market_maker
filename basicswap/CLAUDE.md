@@ -33,7 +33,14 @@ size, since the wallet already held leftover XMR from the earlier test swap.
 (`post_offer`/`revoke_offer`/`get_wallet_balance`); before this, nothing in this
 project could touch a real offer. See `project_status.md`'s matching entries for
 the exact numbers, the real insufficient-funds bug found and fixed before it
-could matter, and verification. Same safety posture as `coinbase_dca/`/
+could matter, and verification.
+
+**2026-09-18**: a volatility kill-switch (`strategy/volatility.py`) is built,
+tested, and deployed to both live loops the same day (restarted, verified
+running, existing live offer survived untouched). See `../project_status.md`'s
+matching entry for the design, threshold calibration, and restart verification.
+
+Same safety posture as `coinbase_dca/`/
 `finance/crypto_yield/`/`copy_trading/` otherwise: personal swaps stay
 human-initiated, no mnemonic/private key is ever generated through or logged
 into a Claude session (`ARCHITECTURE.md` §4), and any further escalation (a

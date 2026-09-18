@@ -1,14 +1,18 @@
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
 from .. import storage
+from ..external_rates import ReferenceRate
 from ..live_maker import (
     AmbiguousLiveOffersError,
     InsufficientBalanceError,
     LiveMakerConfig,
     _resolve_amount_from,
     decide_and_act,
+    run_cycle,
 )
+from ..volatility import VolatilityMonitor
 
 
 def _cfg(**overrides) -> LiveMakerConfig:
@@ -223,6 +227,76 @@ class ResolveAmountFromTests(unittest.TestCase):
         mock_usd_price.side_effect = ExternalRateError("boom")
         cfg = _cfg(amount_from=None, reserve_usd=210.0, coin_from="xmr", coin_to="btc", side="bid")
         self.assertIsNone(_resolve_amount_from(self.client, cfg))
+
+
+def _rate(**overrides) -> ReferenceRate:
+    defaults = dict(
+        coin_from="btc", coin_to="xmr", coingecko_rate=150.0, kraken_rate=None,
+        disagreement_pct=None, coingecko_error=None, kraken_error=None,
+    )
+    defaults.update(overrides)
+    return ReferenceRate(**defaults)
+
+
+class RunCycleKillSwitchTests(unittest.TestCase):
+    """market_maker/next_steps.md #1 — decide_and_act itself has no notion of
+    volatility; run_cycle is where the kill-switch decides whether to call it
+    at all this cycle."""
+
+    def setUp(self):
+        self.conn = storage.connect(":memory:")
+        self.client = MagicMock()
+        self.client.get_wallet_balance.return_value = 1.0
+        self.client.get_sent_offers.return_value = []
+        self.client.post_offer.return_value = "aaaa"
+
+    @patch("strategy.live_maker.external_rates.get_reference_rate")
+    def test_large_move_within_window_skips_the_cycle_entirely(self, mock_rate):
+        monitor = VolatilityMonitor(window_seconds=900)
+        monitor.add(time.time() - 60, 150.0)  # prior cycle's sample, still inside the window
+        # (154 - 150) / mean(150, 154) ~= 2.6%, well past the 0.85% default threshold.
+        mock_rate.return_value = _rate(coingecko_rate=154.0)
+
+        run_cycle(self.client, self.conn, _cfg(), monitor)
+
+        self.client.post_offer.assert_not_called()
+        self.client.revoke_offer.assert_not_called()
+
+    @patch("strategy.live_maker.external_rates.get_reference_rate")
+    def test_small_move_within_window_does_not_trigger_the_kill_switch(self, mock_rate):
+        monitor = VolatilityMonitor(window_seconds=900)
+        monitor.add(time.time() - 60, 150.0)
+        mock_rate.return_value = _rate(coingecko_rate=150.05)  # tiny move, well under threshold
+
+        run_cycle(self.client, self.conn, _cfg(), monitor)
+
+        self.client.post_offer.assert_called_once()
+
+    @patch("strategy.live_maker.external_rates.get_reference_rate")
+    def test_first_ever_sample_cannot_trigger_the_kill_switch(self, mock_rate):
+        # No prior sample yet -> volatility_pct() is None -> must not block the
+        # very first cycle a process runs just because it has no history yet.
+        monitor = VolatilityMonitor(window_seconds=900)
+        mock_rate.return_value = _rate(coingecko_rate=150.0)
+
+        run_cycle(self.client, self.conn, _cfg(), monitor)
+
+        self.client.post_offer.assert_called_once()
+
+    @patch("strategy.live_maker.external_rates.get_reference_rate")
+    def test_kill_switch_leaves_an_existing_live_offer_untouched(self, mock_rate):
+        self.client.get_sent_offers.return_value = [
+            {"offer_id": "aaaa", "rate": "150.99000000", "created_at": time.time(),
+             "is_expired": False, "is_revoked": False}
+        ]
+        monitor = VolatilityMonitor(window_seconds=900)
+        monitor.add(time.time() - 60, 150.0)
+        mock_rate.return_value = _rate(coingecko_rate=154.0)
+
+        run_cycle(self.client, self.conn, _cfg(), monitor)
+
+        self.client.revoke_offer.assert_not_called()
+        self.client.post_offer.assert_not_called()
 
 
 if __name__ == "__main__":

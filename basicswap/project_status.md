@@ -683,3 +683,24 @@ logged "nothing free to offer this cycle" and posted nothing. This is the
 mechanism working exactly as intended: the bid side is now pre-staged and will
 activate automatically (no restart needed) the moment the wallet's XMR value
 exceeds $210 — whether from the ask side filling, or XMR/USD price movement.
+
+## 2026-09-18: volatility kill-switch built (framework-level `next_steps.md` #1)
+
+New `strategy/volatility.py` (`VolatilityMonitor`) + `live_maker.run_cycle`
+changes — full design, real-data threshold calibration, and rollout status
+logged at the framework level in `../project_status.md`'s matching entry (not
+duplicated here, per this directory's now-superseded relationship to
+`market_maker/`). Short version: `run_cycle` now skips posting/reposting for a
+cycle, leaving any existing live offer untouched, when a rolling 15-minute
+window of reference-mid samples moves more than 0.85% — a threshold pulled
+from 512 real samples in this venue's own `direct_rate_snapshots` history, not
+guessed. 14 new tests, 90/90 passing.
+
+**Deployed same day, on Evan's go-ahead**: `kill -TERM` on both real python
+processes (old PIDs 49899 ask / 49900 bid), immediately relaunched via the
+same `nohup ./run_live_maker.sh --loop ...` invocations into the same log
+files (new PIDs 76467/76468). Verified: exactly 2 processes after restart (no
+repeat of the 2026-09-17 orphaned-duplicate bug), both startup log lines show
+the new kill-switch settings, and `/json/sentoffers` confirmed the ask side's
+one live offer survived the restart untouched. Bid side unaffected — still
+under its $210 reserve, as it's been all day.

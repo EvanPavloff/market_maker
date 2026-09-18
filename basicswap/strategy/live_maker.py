@@ -26,6 +26,15 @@ Safety notes:
     cancellations for offers generally; for our OWN offers /json/bids could in
     principle answer this — not built here, a real gap for a future pass, not a
     blocker for a first live test).
+  - Volatility kill-switch (market_maker/next_steps.md #1, built 2026-09-18):
+    run_cycle tracks a rolling window of reference-mid samples via
+    volatility.VolatilityMonitor and skips posting/reposting for a cycle
+    (existing live offer left untouched) if the window's (max-min)/mean move
+    exceeds cfg.kill_switch_volatility_pct — see volatility.py for the
+    real-data calibration behind the default. This is the one control decide_and_act's
+    own drift-based repricing doesn't cover: reprice chases a moved price
+    after the fact every cycle; the kill-switch instead pauses quoting into a
+    market that's still actively moving.
 """
 
 import argparse
@@ -39,6 +48,7 @@ from .api_client import BasicSwapAPIError, BasicSwapClient
 from .config import load_config
 from .external_rates import ExternalRateError
 from .quoter import half_spread_rate
+from .volatility import VolatilityMonitor
 
 log = logging.getLogger("basicswap.strategy.live_maker")
 
@@ -61,6 +71,8 @@ class LiveMakerConfig:
     amount_from: float | None = None  # fixed offer size; mutually exclusive with reserve_usd
     reserve_usd: float | None = None  # "offer everything above this USD value" — see _dynamic_amount_from
     automation_strat_id: int | None = 1
+    kill_switch_window_minutes: float = 15.0  # rolling window volatility.VolatilityMonitor evaluates
+    kill_switch_volatility_pct: float = 0.0085  # see volatility.py's module docstring for calibration
 
     def __post_init__(self):
         has_fixed = self.amount_from is not None
@@ -227,7 +239,9 @@ def _resolve_amount_from(client: BasicSwapClient, cfg: LiveMakerConfig) -> float
     return dynamic_amount
 
 
-def run_cycle(client: BasicSwapClient, conn, cfg: LiveMakerConfig) -> None:
+def run_cycle(
+    client: BasicSwapClient, conn, cfg: LiveMakerConfig, volatility_monitor: VolatilityMonitor
+) -> None:
     try:
         rate = external_rates.get_reference_rate(cfg.coin_from, cfg.coin_to)
     except ExternalRateError as e:
@@ -236,6 +250,19 @@ def run_cycle(client: BasicSwapClient, conn, cfg: LiveMakerConfig) -> None:
     reference_mid = rate.coingecko_rate if rate.coingecko_rate is not None else rate.kraken_rate
     if reference_mid is None:
         log.warning("no usable reference rate for %s/%s this cycle, skipping", cfg.coin_from, cfg.coin_to)
+        return
+
+    now = time.time()
+    volatility_monitor.add(now, reference_mid)
+    vol_pct = volatility_monitor.volatility_pct()
+    if vol_pct is not None and vol_pct > cfg.kill_switch_volatility_pct:
+        log.warning(
+            "%s/%s %s: volatility kill-switch active (%.3f%% move over the last %.0fm exceeds "
+            "%.3f%% threshold) — skipping post/reprice this cycle, any existing live offer is "
+            "left untouched.",
+            cfg.coin_from, cfg.coin_to, cfg.side, vol_pct * 100,
+            cfg.kill_switch_window_minutes, cfg.kill_switch_volatility_pct * 100,
+        )
         return
 
     amount_from = _resolve_amount_from(client, cfg)
@@ -248,7 +275,7 @@ def run_cycle(client: BasicSwapClient, conn, cfg: LiveMakerConfig) -> None:
     )
 
     try:
-        decide_and_act(client, conn, cfg_for_cycle, reference_mid)
+        decide_and_act(client, conn, cfg_for_cycle, reference_mid, now=now)
     except InsufficientBalanceError as e:
         log.error("%s — will keep checking each cycle in case the wallet is funded again.", e)
     except BasicSwapAPIError as e:
@@ -265,21 +292,23 @@ def run(cfg: LiveMakerConfig, loop: bool) -> None:
         timeout_seconds=config.request_timeout_seconds,
     )
     conn = storage.connect(config.db_path)
+    volatility_monitor = VolatilityMonitor(window_seconds=cfg.kill_switch_window_minutes * 60)
     sizing = f"amount={cfg.amount_from:.8f}" if cfg.amount_from is not None else f"reserve_usd=${cfg.reserve_usd:.2f}"
     log.info(
         "LIVE market-making: %s/%s %s, %s half_spread_pct=%.4f "
         "reprice_threshold_pct=%.4f offer_valid_hours=%.2f lock_hours=%.1f valid_hours=%.1f "
-        "automation_strat_id=%s db=%s",
+        "automation_strat_id=%s kill_switch_window_minutes=%.1f kill_switch_volatility_pct=%.4f db=%s",
         cfg.coin_from, cfg.coin_to, cfg.side, sizing, cfg.half_spread_pct,
         cfg.reprice_threshold_pct, cfg.offer_valid_hours, cfg.lock_hours, cfg.valid_hours,
-        cfg.automation_strat_id, config.db_path,
+        cfg.automation_strat_id, cfg.kill_switch_window_minutes, cfg.kill_switch_volatility_pct,
+        config.db_path,
     )
 
     try:
-        run_cycle(client, conn, cfg)
+        run_cycle(client, conn, cfg, volatility_monitor)
         while loop:
             time.sleep(config.poll_interval_seconds)
-            run_cycle(client, conn, cfg)
+            run_cycle(client, conn, cfg, volatility_monitor)
     except AmbiguousLiveOffersError as e:
         log.error(
             "HALTING live_maker — real order-book state doesn't match what this loop's own "
@@ -316,6 +345,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lock-hours", type=float, default=24, help="the offer's HTLC lock window")
     parser.add_argument("--valid-hours", type=float, default=6, help="BasicSwap's own offer-expiry backstop")
     parser.add_argument("--automation-strat-id", type=int, default=1)
+    parser.add_argument(
+        "--kill-switch-window-minutes", type=float, default=15.0,
+        help="rolling window the volatility kill-switch evaluates (see volatility.py)",
+    )
+    parser.add_argument(
+        "--kill-switch-volatility-pct", type=float, default=0.0085,
+        help="(max-min)/mean over the window above which posting/reposting is skipped for "
+        "that cycle; default calibrated from real poller history, see volatility.py",
+    )
     args = parser.parse_args(argv)
 
     if not args.live:
@@ -341,6 +379,8 @@ def main(argv: list[str] | None = None) -> int:
         lock_hours=args.lock_hours,
         valid_hours=args.valid_hours,
         automation_strat_id=args.automation_strat_id,
+        kill_switch_window_minutes=args.kill_switch_window_minutes,
+        kill_switch_volatility_pct=args.kill_switch_volatility_pct,
     )
     try:
         run(cfg, loop=args.loop)
