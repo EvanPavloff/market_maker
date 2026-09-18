@@ -5,6 +5,11 @@ identified in `ARCHITECTURE.md` §§6–9, not by how interesting it is. Items
 already tracked in `basicswap/next_steps.md` at the venue level are referenced,
 not duplicated, unless this level changes their priority.
 
+**Reviewed 2026-09-17, later the same day** (repo now pushed to
+`github.com/EvanPavloff/market_maker`, live loops re-verified healthy — see
+`project_status.md`): priorities below are unchanged from this morning's
+version, with one addition (#9) found during that re-verification.
+
 ## 1. Volatility-based kill-switch `[NOT STARTED]`
 
 **Gap**: `ARCHITECTURE.md` §6 — the PDF's "pause quoting if reference volatility
@@ -124,6 +129,35 @@ daemons for lower-stakes regression testing before scaling real capital further
 is Evan's call, not a default next step — raise it explicitly if/when capital
 sizing is about to increase materially (e.g., before any move past the current
 ~0.008 BTC / reserve-based XMR sizing).
+
+## 9. Duplicate-instance guard for `run_live_maker.sh` `[NOT STARTED, real gap found 2026-09-17]`
+
+**Gap**, found during today's restructure, not from the source PDFs: earlier
+same-day restarts left 5 real `live_maker --live` processes running instead of
+2 (orphaned duplicates — a wrapper shell got killed but its Python child kept
+running independently, `PPID=1`). No collision actually occurred (verified via
+`/json/sentoffers` and the logs before cleanup), but nothing currently stops
+it from happening again — `AmbiguousLiveOffersError` only guards against
+BasicSwap's own state (a second real offer), not against a second local
+process racing the first. Also logged in the outer workspace's `TASKS.md`
+(2026-09-17 entry).
+
+**Concrete shape**: a PID-file (`flock` or a simple `<side>.pid` file checked
+and written at startup, matching this workspace's other single-instance
+scripts) in `run_live_maker.sh`, refusing to start a second instance for the
+same `--side`/pair if one's PID file already points to a live process.
+Cheap, mechanical, no strategy-logic risk — could be picked up independently
+of #1-#8 whenever convenient, doesn't need to wait on more fill data the way
+most of this list does.
+
+**Also worth noting for future debugging, not a to-do**: while re-verifying
+health today, `tail` on `basicswap_live_maker_bid.log` looked stale (last
+visible line ~3 hours old) purely because the since-killed duplicate's
+buffered output flushed to disk on termination, landing physically after the
+live process's own more recent lines. `grep`ing for the live process's actual
+log-message pattern (not just `tail`) resolved it in under a minute — worth
+reaching for that first next time a `nohup`-redirected log looks stale on one
+of these loops, rather than assuming the process itself has stopped.
 
 ## Explicitly not on this list
 

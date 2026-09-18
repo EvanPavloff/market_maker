@@ -1,12 +1,15 @@
 # Market Maker — Project Status
 
-**Status as of 2026-09-17: one live venue (BasicSwap), real money, real fills.
+**Status as of 2026-09-17 (updated later the same day): one live venue
+(BasicSwap), real money, real fills, now with its own GitHub repo.**
 Framework-level docs (this file, `ARCHITECTURE.md`, `next_steps.md`) created
-today** by reviewing `btc_xmr_market_making_framework_v3.1.pdf` and
+today by reviewing `btc_xmr_market_making_framework_v3.1.pdf` and
 `kyc_resilience_mvb_v3.pdf` against the venue-level project's actual state —
-see `ARCHITECTURE.md` for the full ethos-vs-reality gap analysis. This is a
-restructure, not a rebuild: `basicswap/` moved here unchanged
-(`market_maker/basicswap/`) with all its own history/docs intact.
+see `ARCHITECTURE.md` for the full ethos-vs-reality gap analysis. This started
+as a restructure, not a rebuild (`basicswap/` moved here unchanged as
+`market_maker/basicswap/`, all its own history/docs intact), and has since
+been pushed to `github.com/EvanPavloff/market_maker` (see the dated entry
+below) and re-verified live and healthy a second time (also below).
 
 ## What's live right now
 
@@ -91,6 +94,56 @@ operational-hygiene item rather than a strategy gap — worth a line in
   session.
 - Did not evaluate Eigen ASB, Haveno, Bisq, or Trocador. See `next_steps.md`
   #6 for why that's deliberately not next.
+
+## 2026-09-17, later same day: GitHub repo created and pushed
+
+Evan created `git@github.com:EvanPavloff/market_maker.git`. Nested git repo
+initialized at `market_maker/` (not just `market_maker/basicswap/`, per Evan's
+call — the repo covers the whole framework, docs and venue module together),
+`.gitignore` added (`__pycache__/`, `*.pyc`, `.env`, `*.db` — verified none of
+those existed in the tree before committing), 36 files committed
+(`7a4a270`). Root repo's own `.gitignore` updated to exclude `market_maker/`,
+matching the existing `alpaca_bot/`/`futures_bot/`/`polymarket_bot/` pattern.
+
+**Push hit two real, unrelated snags, both resolved same session:**
+- First attempt (`origin` set to the `git@github.com:...` SSH URL Evan gave)
+  was blocked by the harness's own auto-mode permission classifier
+  ("out-of-place publication" — pushing to a brand-new remote isn't
+  auto-approved). Resolved by Evan explicitly approving the push.
+- Second attempt then failed for a real reason: `Permission denied
+  (publickey)` — this machine has no working GitHub SSH key. Checked how
+  every *other* nested-repo project here authenticates
+  (`futures_bot`/`alpaca_bot`/etc.) — all use HTTPS remotes, backed by `gh`'s
+  own logged-in keyring token, not SSH. Switched `market_maker`'s remote from
+  the SSH URL to `https://github.com/EvanPavloff/market_maker.git` to match;
+  push succeeded immediately after. **Worth remembering for any future new
+  repo on this machine: default to the HTTPS remote form, not SSH** — SSH will
+  reliably fail here until a real key is set up.
+
+## 2026-09-17, later same day: live-process health re-check (routine, nothing changed)
+
+Evan asked to confirm the live_maker loops were still up before the doc
+update below. Re-ran the same verification method as the original cleanup:
+`ps aux` (exactly 2 processes, same PIDs as before — 49899 ask, 49900 bid, no
+new duplicates), `/json/sentoffers` (still exactly 1 live offer, ask side),
+and this time additionally stack-sampled the bid process (`sample`/`/usr/bin/
+sample`, not the venv's own same-named `sample` script) since its log's `tail`
+looked stale at first glance — confirmed it was correctly asleep in its poll
+loop, not hung, and a manual recompute of its reserve math against live
+wallet/price data (`0.38555176 XMR available, reserve line 0.4067 XMR at
+$516.36/coin` → `dynamic_amount = -0.021`) confirmed "nothing free to offer"
+is still the correct, current state. The log file's apparent staleness was a
+red herring: `grep`ing the whole file (not just `tail`) found the process's
+real, current "nothing free" entries running up to the moment of the check;
+what `tail` was showing was late-flushed buffered output from the
+already-dead `--amount-from 1.15` duplicate killed in the prior cleanup,
+physically appended after the live process's own more recent lines because
+its buffer only flushed on termination. No action needed — both loops are
+healthy. **Lesson for future checks on this project**: `tail` on these
+`nohup`-redirected logs isn't reliable for "is it stuck" — a dead process's
+buffered output can still be the last bytes in the file. Prefer `grep`ing for
+the process's own known log-message pattern plus a timestamp check, or a
+stack sample, over trusting raw `tail` order.
 
 ## Next action
 
