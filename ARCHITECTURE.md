@@ -126,20 +126,28 @@ inheriting the PDF's assumption that a fallback route is already there.
 
 | Venue | PDF status | Actual status here |
 |---|---|---|
-| BasicSwap | CORE | **Live.** The only venue with any code, any live offer, or any real fill. See `basicswap/CLAUDE.md`/`project_status.md`. |
-| Eigen ASB | CORE | **Not evaluated.** No research has been done on Eigen ASB's API, fee structure, or automation surface. Not scoped. |
-| Haveno / Bisq | CORE / PILOT | **Not evaluated.** The PDF flags multisig security-deposit capital lockup as a real gotcha for these — worth remembering when/if either gets scoped, since it changes the capital-efficiency math versus BasicSwap's model. |
+| BasicSwap | CORE | **Live.** The only venue with any live offer or any real fill. See `basicswap/CLAUDE.md`/`project_status.md`. |
+| Bisq | CORE / PILOT | **Read-only observation live, 2026-09-18.** `venues/bisq/` polls `markets.bisq.network`'s own hosted, public, keyless REST API (`GET /api/offers?market=<pair>`) — no node, daemon, or wallet needed at all, confirmed live against real data (110 sell + 43 buy `xmr_btc` offers in the first real poll). This is a genuinely different setup cost than every other venue here: it's the one candidate where *observation* required no build beyond a poller. Still detection-only — no `postOffer`/write path exists, no capital, no Bisq identity. |
+| Eigen ASB | CORE | **Not evaluated, but scoped lighter than expected.** The `swap` CLI ships a `list-sellers` subcommand (libp2p rendezvous discovery of ASB maker quotes) that doesn't appear to need a funded/synced wallet, per its own `--help` output — needs the compiled binary + Tor, not capital. Next candidate for a second `OfferBookReader`, not yet built.|
+| Haveno | PILOT | **Not evaluated.** No hosted public read endpoint like Bisq's exists — reading the offer book needs the actual Haveno daemon/AppImage running locally (a remote Monero node can stand in for a local one, easing setup, but the Haveno application itself still has to run). Heaviest of the three CORE/PILOT candidates to observe. The PDF also flags multisig security-deposit capital lockup as a real gotcha here if this ever moves past observation. |
 | Trocador / aggregators | REPLENISHMENT | **Not evaluated.** This is the venue that would actually introduce the KYC-adjacent exposure `kyc_resilience_mvb_v3.pdf` is about (see §8) — until this is built, that addendum's core concern doesn't yet apply to this project. |
 | THORChain / Chainflip | WATCHLIST | **Correctly left on watchlist.** The PDF itself notes XMR routing was stagenet-only at time of writing; no reason to move this up until that changes and someone re-checks. |
 
-**Practical read**: this framework is currently a one-venue system wearing a
-multi-venue document. That's fine as a target shape, but every "cross-venue"
-claim in the source PDFs (arbitrage, canary routing across providers, MVB sized
-off multi-provider failure rates) is aspirational until a second venue actually
-exists. `next_steps.md` treats venue expansion as gated on the single-venue edge
-being *proven*, not assumed — see `basicswap/next_steps.md`'s still-open items
-(observation window short of its 1–2 week bar, n=1 on fill-duration
-measurement) before reading anything in this doc as "ready to add a venue."
+**Practical read**: this framework is currently one *live-trading* venue
+(BasicSwap) plus one *observation-only* venue (Bisq) wearing a multi-venue
+document. Bisq's read-only poller is real and running (`venues/` — a
+venue-agnostic `OfferBookReader` interface, see `venues/offer_book.py`), but
+every "cross-venue" claim in the source PDFs that implies *capital* on a
+second venue (arbitrage, canary routing across providers, MVB sized off
+multi-provider failure rates) is still aspirational until that actually
+happens. `next_steps.md` #6 treats live-capital venue expansion as gated on
+the single-venue edge being *proven*, not assumed — see
+`basicswap/next_steps.md`'s still-open items (observation window short of its
+1–2 week bar, n=2 on fill-duration measurement) before reading anything in
+this doc as "ready to trade on a second venue." That gate was never meant to
+block *read-only* observation, which needs no capital and doesn't touch the
+inventory-controller retrofit risk the gate exists to manage — see
+`next_steps.md`'s Bisq entry for that distinction.
 
 ## 8. KYC resilience addendum — what actually applies today
 
