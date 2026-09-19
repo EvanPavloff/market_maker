@@ -958,3 +958,21 @@ last few log lines from both) so whoever runs it can visually confirm
 process exists. **A fresh session's first move here should be checking
 whether this has been run yet**, since the bid side (and possibly the ask
 side too, if it also got stopped) generates zero revenue while down.
+
+**Update, later same day: Evan ran `restart_live_maker.sh`.** Verified: ask
+side confirmed healthy (`half_spread_pct=0.0110` live, exactly 1 process,
+reposting normally ~142-144 XMR/BTC). Bid side is running (crash fixed) but
+**not actually posting anything** — the XMR wallet sits only ~$4.83 above
+the `--reserve-usd 210` floor (0.377113 XMR at ~$569.60/XMR spot), below
+BasicSwap's minimum tradeable chain amount, so every cycle fails with `To
+amount below min value for chain` rather than crashing. Root cause: the
+last real fill (09-18, ~1.1 XMR converted to BTC) left the wallet at this
+level; the crash just meant the loop never got a chance to hit this
+condition for real until the restart. **Deliberately not fixed — Evan's
+explicit call**: he needs that XMR for something else first and will fund
+the wallet more (or reconsider the reserve) once he's done with that and
+once the desk has proven profitable. Not a bug, not urgent, don't re-flag —
+see `../TASKS.md`'s matching entry. Also fixed a harmless cosmetic bug
+found in the process command line this same check (`--live --live` duplicate
+flag in `restart_live_maker.sh`, since `run_live_maker.sh` already
+hardcodes it) — no behavior change, just confusing to read.
