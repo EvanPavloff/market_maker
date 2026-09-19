@@ -372,11 +372,21 @@ key now, with a test covering it.
 `btc->xmr` buy offers from Bisq's live book into a real SQLite file.
 
 **Still exactly what it says on the label — read-only, no capital**: no
-write path, no Bisq identity, not scheduled (launchd) yet, no cross-check
-against `external_rates.py` yet. `next_steps.md` #6's actual subject —
-putting real capital on a second venue — is completely unchanged by this;
-see `next_steps.md` #12 for the full build record and explicitly-not-done
-list.
+write path, no Bisq identity, no cross-check against `external_rates.py` yet.
+`next_steps.md` #6's actual subject — putting real capital on a second
+venue — is completely unchanged by this; see `next_steps.md` #12 for the
+full build record and explicitly-not-done list.
+
+## Bisq poller scheduled via launchd — 2026-09-19
+
+Installed `venues/com.market_maker.venues-poller.plist` (`StartInterval=300`,
+calling the venv python3 directly rather than `run_poller.sh`'s bash wrapper —
+a known launchd-under-`~/Desktop` bug elsewhere in this workspace). Loaded and
+verified: both the automatic `RunAtLoad` run and an explicit `launchctl start`
+completed in ~7s each with real data (128/34 then a later poll), writing to
+`~/coinswaps/venue_observations.db` with no lock conflict between the two
+concurrent runs. Continuous observation history is now accumulating. See
+`next_steps.md` #12's updated entry for the full detail.
 
 ## Handoff for the next session
 

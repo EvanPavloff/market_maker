@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Installed in ~/Library/LaunchAgents/, loaded via `launchctl load`.
+
+  Added 2026-09-18. Runs venues/poller.py's single-cycle mode (no --loop —
+  launchd itself is the loop, via StartInterval) every 5 minutes, matching
+  basicswap/strategy/poller.py's own default cadence for the same underlying
+  order book. Read-only: no node/daemon/wallet needed for Bisq (its own
+  hosted public API), no capital anywhere, no write path.
+
+  Calls ~/coinswaps/venv/bin/python3 directly rather than run_poller.sh (a
+  bash wrapper) — launchd-spawned bash has hit a real "getcwd: Operation not
+  permitted" error reading under ~/Desktop on this machine before (see
+  watch_value_tracker's and world_tracker's daily plists/project_status.md).
+  This binary is the same underlying interpreter
+  (/Library/Frameworks/Python.framework/Versions/3.13/bin/python3.13,
+  confirmed via readlink -f) several already-working launchd jobs on this
+  machine use, so it already has whatever access bash was missing.
+
+  Install:   launchctl load ~/Library/LaunchAgents/com.market_maker.venues-poller.plist
+  Uninstall: launchctl unload ~/Library/LaunchAgents/com.market_maker.venues-poller.plist
+             rm ~/Library/LaunchAgents/com.market_maker.venues-poller.plist
+  Run now (test): launchctl start com.market_maker.venues-poller
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.market_maker.venues-poller</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/evanpavloff/coinswaps/venv/bin/python3</string>
+        <string>-m</string>
+        <string>venues.poller</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/evanpavloff/Desktop/Claude/market_maker</string>
+
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/evanpavloff/Desktop/Claude/market_maker/venues/logs/poller.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/evanpavloff/Desktop/Claude/market_maker/venues/logs/poller.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/evanpavloff/coinswaps/venv/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>

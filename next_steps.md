@@ -512,11 +512,21 @@ polled 110 real `xmr->btc` sell offers (rate range 0.00696–0.00861 BTC/XMR)
 and 43 real `btc->xmr` buy offers (rate range 144.3–193.0 XMR/BTC) into a real
 SQLite file the same session.
 
+**Scheduled 2026-09-19**: `venues/com.market_maker.venues-poller.plist`, a
+launchd agent (`StartInterval=300`, matching `basicswap/strategy/poller.py`'s
+own default cadence) calling `~/coinswaps/venv/bin/python3 -m venues.poller`
+directly — not through `run_poller.sh`'s bash wrapper, since launchd-spawned
+bash has previously hit a real `getcwd: Operation not permitted` error
+reading under `~/Desktop` on this machine (see `watch_value_tracker`'s and
+`world_tracker`'s daily plists). Installed and verified: `launchctl load` +
+an explicit `launchctl start` both completed cleanly (exit 0), writing two
+independent real batches of offers (128 sell / 34 buy, then a second poll)
+into `~/coinswaps/venue_observations.db` with no lock conflict between the
+launchd-triggered run and a concurrent manual run. Continuous history is now
+accumulating toward feeding #11's threshold calibration whenever that gets
+built.
+
 **Deliberately not done yet, and not implied by this**:
-- **Not scheduled** (no launchd job) — this ran on-demand today; cadence/
-  retention is an open call, not a default. Add when there's a reason to want
-  continuous history (e.g. feeding #11's threshold calibration once that gets
-  built).
 - **No cross-check against `basicswap/strategy/external_rates.py`'s reference
   rate yet** — Bisq's own implied rate isn't compared against CoinGecko/
   Kraken the way BasicSwap's `direct_rate_snapshots` does. Worth adding once
