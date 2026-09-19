@@ -899,3 +899,62 @@ workspace's `TASKS.md` instead of here since they need a human decision**:
    but it's a stale, wrong price sitting on a real public order book.
    Revoking it is one `client.revoke_offer()` call away — not done
    unprompted since it's a real action against live infrastructure.
+
+## 2026-09-19: a third real fill found (undocumented until now), bid-side crash #2, spread repriced, restart script built (not yet run)
+
+**Pulling real trade data for a profitability estimate found a real fill
+this file never mentioned**: bid `000000006aad7bcebeefd6601a88e64cfe4d71c64175c3980be600a1`
+(Monero→Bitcoin, 1.097586717518 XMR → 0.00750848 BTC, rate 0.00684089)
+completed 09-18 14:33:37, per `basicswap.log`'s own `Swap completed for bid
+...` / `checkBidState ... 8` lines — the bid-side loop's own first real
+fill (distinct from both the 09-17 manual mechanics-test swap and the
+mispriced ask-side fill above). Reference rate near acceptance
+(`direct_rate_snapshots`, ~13:58) was ~0.00686–0.00687 BTC/XMR; the realized
+0.00684089 is ~0.3–0.4% below that — within this pair's own normal-noise
+band (15-min p50/p90 0.22%/0.49%), not a repeat of the disagreement-gate
+incident above, just an ordinary quote-to-fill adverse move that happened to
+be close to eating the whole configured spread once fees are netted out.
+
+**The two follow-ons from the mispricing incident above are now resolved**,
+checked live rather than assumed: the ask wallet holds 0.00808069 BTC
+(refunded), and offer `000000006aad65d1...` shows `is_revoked: true` on
+`/json/sentoffers`. Neither this session nor any documented one did either
+— happened via some other path.
+
+**Bid-side crashed again, a different bug**: `basicswap_live_maker_bid.log`'s
+last line before going silent (~09-18 16:25, ~19h down by the time this was
+caught) is a bare `KeyError: 'balance'` in `api_client.get_wallet_balance` —
+`/json/wallets` returned a wallet entry with no `balance` key at all
+(transient; the same call returns normally now), and unlike the
+`TimeoutError` this file's #10 entry already fixed, a bare `KeyError` wasn't
+wrapped as `BasicSwapAPIError` either, so it killed the loop the same way.
+**Fixed**: `get_wallet_balance` now checks for the `balance` key before
+indexing and raises `BasicSwapAPIError` if it's missing, matching the
+pattern already used for the unknown-coin check one line above it. 1 new
+test (`test_get_wallet_balance_raises_on_missing_balance_key`).
+
+**Also repriced, Evan's explicit call**: `--half-spread-pct` default 0.0066
+→ 0.011, in response to the bid-side fill above barely clearing (and,
+before this fix, potentially not even clearing) the configured spread once
+the ~$0.50-1.50 on-chain fee was netted out. Calibrated to this pair's real
+15-min p99 move (0.84%, `volatility.py`'s 512-sample calibration) plus fee —
+see the inline comment at the CLI arg definition in `strategy/live_maker.py`
+for the full reasoning. Resulting ~2.2% effective two-sided spread stays
+close to the market's own observed ~2.05-2.09% historical median rather than
+pricing us out of it. **98/98 tests passing** (was 97).
+
+**NOT deployed** — restarting the two live loops to pick up both changes
+was blocked by the sandbox's auto-mode classifier refusing `kill`/`ps -p`
+against the live PIDs ("Interfere With Workloads"), even with Evan's
+explicit go-ahead to fix and redeploy. Built `restart_live_maker.sh`
+instead (new file, this directory) — stops whichever of the two loops are
+actually still alive (checked via the same lock-file + `ps -p ... -o
+command=` pattern `run_live_maker.sh`'s own duplicate-instance guard uses,
+so it won't touch some unrelated process on a reused PID), waits up to 15s
+for a clean exit before a hard kill, relaunches both sides with the same
+flags as the 09-18 restart, and prints a verification block (process count,
+last few log lines from both) so whoever runs it can visually confirm
+`half_spread_pct=0.0110` shows up in both startup lines — not just that a
+process exists. **A fresh session's first move here should be checking
+whether this has been run yet**, since the bid side (and possibly the ask
+side too, if it also got stopped) generates zero revenue while down.

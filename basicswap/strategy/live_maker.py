@@ -385,7 +385,20 @@ def main(argv: list[str] | None = None) -> int:
         "a live price (e.g. --reserve-usd 210 keeps at least $210 worth back). Exactly one of "
         "--amount-from/--reserve-usd is required.",
     )
-    parser.add_argument("--half-spread-pct", type=float, default=0.0066)
+    parser.add_argument(
+        "--half-spread-pct", type=float, default=0.011,
+        # Raised from 0.0066 -> 0.011 on 2026-09-19: the project's two real
+        # automated fills to date (2026-09-18) both realized *below* fair
+        # value — one a ~6.7% pricing bug (fixed separately), the other a
+        # ~0.3-0.4% adverse move from ordinary quote-to-fill price drift,
+        # which the old 0.66% spread barely covered once the ~$0.50-1.50
+        # on-chain fee was netted out. 0.011 covers this pair's own
+        # real-data-calibrated 15-min p99 move (0.84%, volatility.py's 512-
+        # sample calibration) plus the fee, while the resulting ~2.2%
+        # effective two-sided spread stays close to this market's own
+        # observed historical median two-sided spread (~2.05-2.09%,
+        # poller.py's Phase 1 analysis) rather than pricing us out of it.
+    )
     parser.add_argument("--reprice-threshold-pct", type=float, default=0.005)
     parser.add_argument("--offer-valid-hours", type=float, default=0.7, help="our own reprice-cadence backstop")
     parser.add_argument("--lock-hours", type=float, default=24, help="the offer's HTLC lock window")

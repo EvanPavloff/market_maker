@@ -388,63 +388,143 @@ completed in ~7s each with real data (128/34 then a later poll), writing to
 concurrent runs. Continuous observation history is now accumulating. See
 `next_steps.md` #12's updated entry for the full detail.
 
+## Bisq poller hang, same day — the real incident behind that "verified" claim
+
+The section above's "completed in ~7s each" is true of the run that actually
+got documented — but it wasn't the first attempt. An earlier verification
+pass (create the plist, `launchctl load`, then a manual foreground
+`python -m venues.poller` run to double-check) got stuck for 2h45m+ with
+zero log output. A fresh diagnostic traced it to a stalled
+`urllib.request.urlopen()` call inside `bisq/client.py`'s `get_offers()` —
+almost certainly the Mac sleeping mid-request. Python's per-socket
+`timeout=10` parameter doesn't reliably re-fire after a sleep/wake cycle, so
+the call hung indefinitely instead of raising. Both the launchd-spawned
+process and the manual foreground process it was blocked on sat hung; the
+Bisq API itself was (and is) fine — a direct `curl` once the stuck
+processes were killed returned real, valid data in under a second.
+
+A second Claude session, working this same directory concurrently, found
+the hung processes, confirmed the API was healthy via `curl`, killed the
+stuck PIDs (`launchctl unload` + `kill -9`), reloaded the job, and
+re-verified manually — that clean re-run is what produced the 128/34 offer
+counts documented above. Killing those processes also appears to be what
+unblocked *this* session's own stuck foreground call: the "scheduled via
+launchd" entry above was written and committed within ~10 seconds of that
+cleanup. Recording this explicitly because the "verified... 7s" framing on
+its own gives a future reader no signal this failure mode exists — see the
+new session-start checklist in `../CLAUDE.md` for how to recognize and
+recover from it without losing hours.
+
+**Not yet done as a result of this**: no code change was made — the hang is
+an environmental gotcha (sleep/wake vs. per-socket timeout), not a logic bug
+in `client.py`, and a single stalled poll cycle has no consequence (read-only,
+no capital, the next 5-minute cycle just tries again) as long as a hung
+process doesn't sit blocking the launchd slot indefinitely, which it did
+here. Worth considering later, not urgent: a hard wall-clock deadline around
+the whole `get_offers()` call (e.g. `signal.alarm` or a watchdog thread)
+rather than relying solely on the per-socket timeout, since that's the one
+thing that didn't actually protect against this. Not logged as a numbered
+`next_steps.md` item — low value relative to the rest of the queue given the
+no-consequence framing above, but worth a look if the hang recurs.
+
+## 2026-09-19: bid-side crash #2 fixed (restart pending), spread repriced, Eigen ASB wallet-free discovery found + new transport blocker
+
+**Pulling real trade data for a profitability estimate surfaced two things
+no doc had caught**: a third real fill (`basicswap/project_status.md` didn't
+mention it — the bid-side loop's own first real fill, 09-18 ~14:33, XMR→BTC
+at 0.00684089, ~0.3-0.4% below fair — small, real, unremarkable-looking
+loss, not a repeat of the #10 mispricing bug), and a second, different
+bid-side crash (`KeyError: 'balance'` in `api_client.get_wallet_balance`,
+not the `TimeoutError` #10's entry already fixed) that had been down ~19h
+with nothing monitoring for it. Both `TASKS.md`-logged follow-ons from the
+#10 incident (ask wallet out of funds, stale offer still listed) turned out
+to already be resolved by the time this session checked — via some
+unwritten-up path, not this session or any documented one.
+
+**Fixed, on Evan's go-ahead**: `api_client.get_wallet_balance` now checks
+for the `balance` key before indexing instead of raising a bare `KeyError`
+(same pattern as #10's `TimeoutError` fix). Also **repriced**
+`--half-spread-pct` 0.0066 → 0.011 (Evan's explicit call, in response to the
+~0.3-0.4% noise loss above barely clearing the old spread net of fees) —
+calibrated to this pair's real 15-min p99 move (0.84%, `volatility.py`'s 512-
+sample calibration) plus fee, with the resulting ~2.2% effective two-sided
+spread still close to the market's own observed ~2.05-2.09% median. 98/98
+tests passing. **Restart is NOT deployed** — the sandbox refused to let this
+session `kill`/`ps -p` the live PIDs even with explicit go-ahead
+("Interfere With Workloads"). Built `basicswap/restart_live_maker.sh`
+instead — stops whichever loops are actually alive (via the same lock-file +
+process-name check `run_live_maker.sh`'s own guard uses), waits for a clean
+exit, relaunches both with the same flags as the 09-18 restart, and prints
+verification output — ready for Evan to run.
+
+**Eigen ASB (`next_steps.md` #13, full detail there)**: found the earlier
+"doesn't need a wallet" characterization was wrong for the current release
+(every CLI subcommand creates a real wallet, confirmed by reading
+`ContextBuilder::build()` directly, not just observing it) — but also found
+a real, genuinely wallet-free alternative in the same source tree
+(`swap-p2p`'s `fetch_quotes` example, in-memory-only libp2p identity, no
+Monero code touched at all). Built and ran it for real: Tor bootstraps
+fine, but discovery against all 4 official rendezvous nodes fails for two
+diagnosed reasons — a missing WebSocket transport layer for clearnet `wss`
+addresses, and Tor hidden-service descriptor lookups failing for all 4 onion
+fallbacks. Zero quotes so far, not because there's no path forward, but
+because neither dial path currently completes. Concrete next step (add real
+WebSocket transport support) is scoped, not started.
+
 ## Handoff for the next session
 
 **Goal of this project**: prove out (then grow) a profitable, eventually
 multi-venue crypto market-making function. Right now that means one venue
-(BasicSwap, non-custodial BTC/XMR atomic swaps) with two live loops actually
-posting/revoking real offers with real money.
+(BasicSwap, non-custodial BTC/XMR atomic swaps) with two loops meant to be
+posting/revoking real offers with real money continuously — but see #1
+below, that's not true of the bid side right now.
 
 **Do this first — there are real open items from today, not just "verify a
 snapshot"**:
-1. **Check `TASKS.md`'s 2026-09-18 mispricing entry — two follow-ons still
-   need a human decision.** The ask wallet has only 0.00057685 BTC left
-   (below the 0.008 the offer quotes) and needs either refunding or a
-   smaller `--amount-from` to resume quoting. Separately, the already-filled
-   offer that started this whole investigation
-   (`000000006aad65d120f29f0bab44d706846836375a752eb8b5867618`, still
-   advertising the stale 136.17 XMR/BTC rate) is **still listed as active**
-   on BasicSwap's own book — `live_maker.py` deliberately never revokes an
-   offer it can't afford to replace, which wasn't written with "permanently
-   unfundable" in mind. Neither is fixed; both are flagged, not silently
-   left to be rediscovered.
-2. **Read `next_steps.md` #11 before building anything resembling a
+0. **Run `../CLAUDE.md`'s session-start checklist before anything else in
+   this directory** — it exists because of a real 2h45m hang found and fixed
+   2026-09-18 (see this file's "Bisq poller hang, same day" entry above);
+   don't skip it just because the poller *looks* scheduled and fine.
+1. **Check whether `basicswap/restart_live_maker.sh` has been run yet.**
+   `ps aux | grep live_maker` should show exactly 2 processes; check both
+   startup log lines (`~/coinswaps/basicswap_live_maker.log` and
+   `..._bid.log`) for `half_spread_pct=0.0110` specifically, not just that a
+   process exists — `0.0066` in either log means the restart hasn't
+   happened yet and the bid side may still be down. If it hasn't happened,
+   that's the single highest-priority item — the bid side generates zero
+   revenue while down.
+2. **If picking up Eigen ASB (`next_steps.md` #13)**: the WebSocket
+   transport fix is scoped and ready to implement — read that item's full
+   entry before starting, it has the exact failure modes and the specific
+   file (`create_transport()` in `fetch_quotes_json.rs`) that needs the fix.
+   The `eigenwallet-core` clone with both built examples lives in the prior
+   session's scratchpad, not this repo — recreate it if it's gone (cheap,
+   33MB, no submodules needed for this).
+3. **Read `next_steps.md` #11 before building anything resembling a
    cross-venue offer scanner** — Evan asked for this idea to be designed and
-   logged, explicitly *not* built yet. It's fully speced there (interface
-   shape, reuse of #10's trust gate, threshold calibration approach,
-   detection-only-first posture). Don't start implementing it without
-   checking with Evan first — it's a new, higher-risk capability (acting on
-   other participants' public data, not just quoting our own book).
+   logged, explicitly *not* built yet. Don't start implementing it without
+   checking with Evan first.
 
 **What's true right now (verify before trusting, this is a snapshot)**:
 - Volatility kill-switch (#1), duplicate-instance PID guard (#9), and the
-  source-disagreement gate (#10) are all **built, tested (97/97), and
-  deployed** — confirmed via both live processes' startup logs showing
-  `max_source_disagreement_pct=0.0150` after the 2026-09-18 13:34 restart.
-  Mispriced-offer scanner (#11) is **designed only, explicitly not to be
-  built without further sign-off**.
-- The project's second real fill (first from the automated loop itself)
-  completed today and was mispriced ~6.7% below fair value — see
-  `basicswap/project_status.md`'s "the fill completed — and was mispriced"
-  entry for the full reconstruction, root cause, and both fixes (#10 plus an
-  incidental bid-loop-crash fix). This is also new evidence for
-  `next_steps.md` #4 (fill-vs-expiry detection): n=2 now, not n=1.
+  source-disagreement gate (#10) are all **built and tested**, but their
+  live-deployment status depends on whether item #1 above (the restart) has
+  happened — check the logs, don't assume.
+- Three real fills exist now (2026-09-17 manual mechanics test, 2026-09-18
+  ask-side mispricing loss, 2026-09-18 bid-side near-fair loss) — all three
+  negative relative to fair value so far, none of them gains. New evidence
+  for `next_steps.md` #4 (fill-vs-expiry detection): still n=2 on the
+  *automated*-loop count that item cares about, unchanged.
 - Every other item on `next_steps.md` (#2 real MVB, #3 P&L ledger, #4 fill-
   vs-expiry detection, #5 tax lots, #7 inventory controller) is **still
-  blocked**, per that file's own explicit gating. None of them are safe to
-  just start without checking whether that gate has cleared.
-- **#6 (venue #2, live capital) is still blocked** — but #6's gate was
-  narrowed 2026-09-18 to cover only *putting capital* on a second venue, not
-  *observing* one. **#12 (Bisq read-only observation poller) is built and
-  verified live**, independent of #6's gate, since it needs no capital, no
-  wallet, and doesn't touch the inventory-controller retrofit risk #6 exists
-  to manage. See `next_steps.md` #6/#12 for the distinction.
+  blocked**, per that file's own explicit gating.
+- **#6 (venue #2, live capital) is still blocked** — narrowed 2026-09-18 to
+  cover only *putting capital* on a second venue, not *observing* one.
+  **#12 (Bisq)** is built and verified live. **#13 (Eigen ASB)** is built
+  but not yet returning real data — see above.
 
 **Do not put real capital on #6 (venue #2) or start #7 (inventory
 controller)** without an explicit human decision first — both are
-deliberately deferred per `next_steps.md` #6/#7's own reasoning (retrofitting
-a second venue's capital onto an unproven single-venue edge is the mistake
-being guarded against, not a decision this session or a future one should
-make unilaterally). Same rule now applies to #11 per Evan's own framing of
-it. Read-only observation work (more of #12, or a second `OfferBookReader`
-for Eigen ASB) is *not* subject to this — it's a different, lower-risk ask.
+deliberately deferred per `next_steps.md` #6/#7's own reasoning. Same rule
+applies to #11. Read-only observation work (#12, #13, or a future venue) is
+*not* subject to this — it's a different, lower-risk ask.

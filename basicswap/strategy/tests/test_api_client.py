@@ -79,6 +79,17 @@ class BasicSwapClientTests(unittest.TestCase):
             self.client.get_wallet_balance("xmr")
 
     @patch("strategy.api_client.urllib.request.urlopen")
+    def test_get_wallet_balance_raises_on_missing_balance_key(self, mock_urlopen):
+        # Real incident 2026-09-19: /json/wallets returned an XMR entry with no
+        # "balance" key at all (transient), and the bare KeyError this used to
+        # raise crashed the whole live_maker bid loop for ~19h — the same
+        # failure shape as the 2026-09-18 TimeoutError bug, just a different
+        # cause, since a bare KeyError wasn't wrapped as BasicSwapAPIError either.
+        mock_urlopen.return_value = _fake_response({"XMR": {"unconfirmed": "0.0"}})
+        with self.assertRaises(BasicSwapAPIError):
+            self.client.get_wallet_balance("xmr")
+
+    @patch("strategy.api_client.urllib.request.urlopen")
     def test_get_sent_offers_parses_list(self, mock_urlopen):
         mock_urlopen.return_value = _fake_response([{"offer_id": "aa11", "is_own_offer": True}])
         offers = self.client.get_sent_offers(coin_from="btc", coin_to="xmr")

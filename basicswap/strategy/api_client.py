@@ -142,7 +142,17 @@ class BasicSwapClient:
         wallets = self._post("/json/wallets", {})
         if not isinstance(wallets, dict) or coin.upper() not in wallets:
             raise BasicSwapAPIError(f"no wallet info for {coin!r} in /json/wallets response")
-        return float(wallets[coin.upper()]["balance"])
+        entry = wallets[coin.upper()]
+        if not isinstance(entry, dict) or "balance" not in entry:
+            # Real incident 2026-09-19: BasicSwap returned a wallet entry for a
+            # coin with no "balance" key at all (transient — a retry moments
+            # later had it), and the bare KeyError this used to raise wasn't
+            # wrapped as BasicSwapAPIError, so it crashed the whole live_maker
+            # loop the same way the 2026-09-18 TimeoutError bug did.
+            raise BasicSwapAPIError(
+                f"/json/wallets response for {coin!r} has no 'balance' field: {entry!r}"
+            )
+        return float(entry["balance"])
 
     def get_sent_offers(
         self, coin_from: str | None = None, coin_to: str | None = None, limit: int = 100

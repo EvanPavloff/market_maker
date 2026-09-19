@@ -5,7 +5,7 @@ identified in `ARCHITECTURE.md` §§6–9, not by how interesting it is. Items
 already tracked in `basicswap/next_steps.md` at the venue level are referenced,
 not duplicated, unless this level changes their priority.
 
-## Status at a glance (as of 2026-09-18 — verify before trusting, this is a snapshot)
+## Status at a glance (as of 2026-09-19 — verify before trusting, this is a snapshot)
 
 | # | Item | Status |
 |---|------|--------|
@@ -14,13 +14,14 @@ not duplicated, unless this level changes their priority.
 | 3 | Per-fill P&L ledger | Blocked on #4 |
 | 4 | Real fill-vs-expiry detection | Blocked — n=2 real fills now, not yet enough to start; not gated on a fixed count, a judgment call |
 | 5 | Tax lot tracking | Blocked on #3 |
-| 6 | Venue #2 scoping | Deliberately not started — needs explicit human sign-off first |
+| 6 | Venue #2 scoping (capital) | Deliberately not started — needs explicit human sign-off first |
 | 7 | Inventory controller | Deliberately not started — trigger is #6 actually happening |
 | 8 | Testnet/shadow-engine backfill | Open question, not a commitment — raise before any capital-size increase |
 | 9 | Duplicate-instance PID guard | **DONE, deployed** |
 | 10 | Source-disagreement gate | **DONE, deployed** (built same-day in response to a real, quantified loss — see its entry) |
 | 11 | Mispriced-offer opportunity scanner (cross-venue) | **Designed only, deliberately NOT built** — Evan's explicit instruction |
 | 12 | Bisq read-only observation poller (venue #2, observation-only) | **DONE, verified live** — no capital, no write path |
+| 13 | Eigen ASB read-only discovery (venue #3, observation-only) | **Wallet-free path found + built; blocked on a WebSocket transport gap** — not yet returning real quotes |
 
 **The four `DONE` items (#1, #9, #10, #12) are all live/verified right now**
 (#1/#9/#10 confirmed via both live BasicSwap processes' startup logs; #12
@@ -30,15 +31,29 @@ must not be started without checking with Evan first** — it's a new,
 higher-risk capability (acting on other participants' public data), not
 just a documentation gap to fill in.
 
-**Two real, unresolved follow-ons from the #10 incident need a human
-decision, not more code — tracked in the outer workspace's `TASKS.md`, not
-duplicated here**: (1) the ask wallet is out of BTC and idle until refunded
-or `--amount-from` is lowered; (2) the offer that caused the incident is
-still listed as active on BasicSwap's own book at its stale, wrong rate,
-not auto-revoked. **First action for a fresh session: check `TASKS.md`'s
-2026-09-18 entry for whether either has been resolved since**, then re-check
-live process health (`ps aux | grep live_maker` — expect exactly 2, no
-separate wrapper shell) before assuming anything below is safe to build on.
+**The #10-incident follow-ons are now resolved** (checked live 2026-09-19,
+not just re-read from the old note): the ask wallet holds 0.00808069 BTC
+(refunded — above the 0.008 the offer quotes), and the stale
+136.17-XMR/BTC-priced offer now shows `is_revoked: true` on
+`/json/sentoffers`. Neither this session nor any documented one revoked it
+or refunded the wallet, so it happened via some other path (Evan directly,
+or an unwritten-up session) — worth a quick confirmation with him, not
+reopening the item over.
+
+**New as of 2026-09-19, replacing the above as the current pending item**:
+the bid-side loop crashed again on a *different* bug (`KeyError: 'balance'`
+in `api_client.get_wallet_balance`, ~19h down as of the fix) — root-caused
+and fixed in code, plus `--half-spread-pct` bumped 0.0066 → 0.011 (Evan's
+call, in response to the ~0.3-0.4% adverse-noise loss on the bid side's one
+real fill — see `basicswap/project_status.md`). 98/98 tests passing.
+**Restart is not yet deployed** — the sandbox blocked killing/restarting the
+live processes directly; a purpose-built script,
+`basicswap/restart_live_maker.sh`, is ready for Evan to run himself. **First
+action for a fresh session: check whether that restart has happened**
+(`ps aux | grep live_maker` — expect exactly 2 processes; check both
+startup log lines for `half_spread_pct=0.0110`, not `0.0066`, to confirm the
+new build is actually running, not just that a process exists) before
+assuming anything below is safe to build on.
 
 Every other item (#2–#8) is genuinely blocked per its own entry's specific
 gate, not just deprioritized — read that entry before starting, don't infer
@@ -537,6 +552,125 @@ built.
 - **Eigen ASB and Haveno remain unbuilt** — see the research above; Eigen ASB
   is the more likely next pickup given its lighter apparent setup cost, not
   yet confirmed by actually building it.
+
+**A real hang happened during this same-day verification, not just a clean
+7-second run** — a manual foreground re-check of the poller got stuck 2h45m+
+on a stalled `urlopen()` call (sleep/wake vs. Python's per-socket timeout,
+not a Bisq API problem), and was found and killed by a second concurrent
+Claude session. Full incident + why no code fix was needed is in
+`project_status.md`'s "Bisq poller hang, same day" entry; the recovery steps
+are now standing guidance in `../CLAUDE.md`'s session-start checklist — run
+that checklist before touching this poller in any future session.
+
+## 13. Eigen ASB read-only discovery `[BUILT, BLOCKED on a WebSocket transport gap — 2026-09-19]`
+
+**Where this picks up from #12's own note**: "Eigen ASB is the more likely
+next pickup given its lighter apparent setup cost, not yet confirmed by
+actually building it." Actually building it found that the earlier
+characterization (from `ARCHITECTURE.md`'s pre-2026-09-19 §7 row, itself
+sourced from stale `comit-network/xmr-btc-swap` dev-docs) was wrong on the
+specifics, but a real wallet-free path exists anyway once you look at the
+current source directly instead of trusting old docs.
+
+**What was actually wrong with the old assumption**: downloaded and
+GPG-verified the real `swap` v4.14.0 binary from `github.com/eigenwallet/core`
+(signature checked against the project's own published key). Two real
+findings:
+1. **No `list-sellers` subcommand exists any more** — checked `swap --help`
+   directly; the CLI's current subcommand set is `balance`, `cancel-and-
+   refund`, `config`, `export-bitcoin-wallet`, `history`, `logs`, `monero-
+   recovery`, `resume`, `withdraw-btc`. Discovery moved elsewhere.
+2. **Every one of those subcommands, including the least-stateful-looking
+   `config`, unconditionally creates a real Monero wallet keyfile + a
+   libp2p identity seed on disk** — confirmed both by watching it happen
+   live (`swap-tool-blockchain-monitoring-wallet.keys`, `seed.pem`
+   appeared after a bare `swap config`) and by reading
+   `ContextBuilder::build()` in `swap/src/cli/api.rs` directly: every
+   `CliCommand` branch in `command.rs`'s `apply_defaults()` calls
+   `.build()`, and `build()` calls `wallet_setup::open_monero_wallet(...)`
+   unconditionally, regardless of `self.monero_config` being `Some` or
+   `None`. This isn't a flag you're missing — there's no observe-only mode
+   in the CLI as currently written. The generated wallet was deleted before
+   anything could touch it (created seconds before deletion, never funded).
+
+**The actual wallet-free path**: `swap-p2p` (the crate implementing the
+libp2p networking layer both the CLI and GUI share) ships its own example,
+`examples/fetch_quotes.rs`, gated behind a `fetch-quotes-example` Cargo
+feature. It does rendezvous discovery + quote fetching using only an
+in-memory `identity::Keypair::generate_ed25519()` — generated fresh per run,
+never written to disk, holds no funds. Confirmed via `swap-p2p`'s own
+`Cargo.toml` dependency list (`swap-core`, `swap-machine`, `swap-env`,
+`swap-serde`, `bitcoin-wallet` — none of these pull in `monero-sys`, the
+crate that makes the full `swap`/`asb` binaries so large and wallet-heavy)
+that this example never touches Monero wallet code at all.
+
+**Built and verified real, not just read about**:
+- Shallow-cloned `eigenwallet/core` (33MB, no submodules needed — the
+  `monero-sys/monero` submodule is irrelevant to `swap-p2p`).
+- Built the unmodified upstream `fetch_quotes` example successfully —
+  confirms the wallet-free claim isn't just a reading of the dependency
+  graph, it actually compiles without the heavy Monero C++ toolchain.
+- Wrote a second example in the same crate, `fetch_quotes_json.rs` (not
+  upstream code — this project's own addition, `#![allow(unused_crate_
+  dependencies)]` at the top same as the original): runs for a bounded
+  window (`FETCH_QUOTES_TIMEOUT_SECS`, default 25s) instead of looping
+  forever, keeps the latest `CachedQuotes` snapshot (each event already
+  carries the full current set, not a delta), and prints exactly one JSON
+  array to stdout on exit — all logging routed to stderr so stdout stays
+  parseable. This is the shape a Python poller needs (`subprocess.run()`
+  once per cycle, matching `venues/poller.py`'s existing per-cycle-call
+  pattern). Compiles clean (4.34s incremental build once the base
+  dependency graph was already resolved).
+
+**Ran it for real against the live network — this is where it's currently
+blocked**: Tor (`arti-client`, a pure-Rust in-process Tor client — no system
+`tor` daemon needed) bootstraps fine every time (real consensus loaded, real
+guards found, ~10-12s). But discovery against all 4 of
+`swap_env::defaults::default_rendezvous_points()`'s rendezvous nodes
+(eigenwallet x2, atomicworld, stealthswap — each with a clearnet-`wss` +
+`onion3` address) consistently returns zero quotes. Root-caused via
+`libp2p_swarm=debug` trace logging, not guessed — **two distinct, confirmed
+failure modes, not one vague "network issue"**:
+
+1. **Clearnet `wss` addresses fail with `ProtocolError(InvalidMessage)`** at
+   the multistream-select layer. `fetch_quotes_json.rs`'s `create_transport()`
+   (copied verbatim from the upstream example — not something this session
+   changed) tunnels Tor-proxied TCP straight into noise/yamux with no actual
+   WebSocket/TLS layer wrapped around it for the `/wss` multiaddr suffix.
+   This looks like a real gap in the *upstream* example too, likely unnoticed
+   by its maintainers because normal operation relies on the onion path
+   succeeding instead — worth checking if this is a known issue upstream
+   before assuming it needs fixing here from scratch.
+2. **All 4 onion addresses fail via `ObtainHsCircuit` → `DescriptorDownload`
+   errors** — repeated `HTTP 404 Not Found` from multiple independent Tor
+   hidden-service directory nodes trying to fetch each service's descriptor,
+   for every one of the 4 independently-operated services. Tor's base
+   directory/consensus loads fine (this isn't a broader Tor problem on this
+   machine) — it's specifically hidden-service descriptor lookups failing.
+   Consistent across 4 unrelated operators reads as more likely a
+   directory-freshness/`arti-client` quirk than 4 simultaneous real outages,
+   but this isn't confirmed either way — could also just be real.
+
+**Concrete next step, not yet attempted**: add a real WebSocket transport
+layer to `create_transport()` for the clearnet path — `libp2p`'s own
+`websocket` transport crate (or equivalent), wrapped under the existing
+Tor-proxied-TCP → noise → yamux stack, specifically for addresses ending in
+`/wss`. This would resolve failure mode #1 independently of whatever's
+going on with #2's onion lookups, and clearnet succeeding alone would be
+enough to get real quotes flowing. If clearnet still fails after that fix,
+revisit #2 (try a plain non-Tor dial to the clearnet `wss` addresses as a
+diagnostic — bypasses Tor entirely to isolate whether Tor-tunneling is part
+of the WebSocket problem, separate from the onion-specific HSDir issue).
+
+**Where things are saved**: `eigenwallet-core` clone (with both the
+unmodified `fetch_quotes.rs` and the new `fetch_quotes_json.rs`, plus the
+`Cargo.toml` edits adding `serde_json` and the second `[[example]]` entry)
+is in this session's scratchpad, not yet copied into this repo — a fresh
+session should either recreate the clone (fast, 33MB, no submodules needed)
+or ask whether the scratchpad copy is still around. No production Python
+code (`venues/eigen_asb/` client+reader, matching `venues/bisq/`'s shape) has
+been written yet — that's the step *after* real quotes are flowing, not
+before, so it isn't built against a binary that returns nothing.
 
 ## Explicitly not on this list
 
