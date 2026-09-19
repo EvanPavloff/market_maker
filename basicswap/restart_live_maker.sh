@@ -51,12 +51,12 @@ stop_if_running "$LOCK_DIR/live_maker_xmr-btc-bid.pid"
 
 echo
 echo "=== Starting ask side (btc->xmr, fixed 0.008 BTC) ==="
-nohup ./run_live_maker.sh --live --loop --coin-from btc --coin-to xmr --side ask --amount-from 0.008 \
+nohup ./run_live_maker.sh --loop --coin-from btc --coin-to xmr --side ask --amount-from 0.008 \
     >>"$SWAP_DATADIR/basicswap_live_maker.log" 2>&1 &
 disown
 
 echo "=== Starting bid side (xmr->btc, reserve \$210) ==="
-nohup ./run_live_maker.sh --live --loop --coin-from xmr --coin-to btc --side bid --reserve-usd 210 \
+nohup ./run_live_maker.sh --loop --coin-from xmr --coin-to btc --side bid --reserve-usd 210 \
     >>"$SWAP_DATADIR/basicswap_live_maker_bid.log" 2>&1 &
 disown
 
