@@ -50,3 +50,14 @@ def to_display_name(ticker_or_name: str) -> str:
     pair" as a legitimate empty result, not an error (see
     summarize_pair_with_no_data_is_empty_not_error)."""
     return _DISPLAY_NAMES.get(ticker_or_name.lower(), ticker_or_name)
+
+
+def to_ticker(display_name_or_ticker: str) -> str:
+    """Inverse of to_display_name ("Monero" -> "xmr"), for callers that store
+    display names but need external_rates.py's ticker keys. Unmapped input
+    passes through lowercased."""
+    name = to_display_name(display_name_or_ticker)
+    for ticker, display in _DISPLAY_NAMES.items():
+        if display == name:
+            return ticker
+    return display_name_or_ticker.lower()

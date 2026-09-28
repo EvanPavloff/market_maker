@@ -117,6 +117,12 @@ class ReferenceRate:
     disagreement_pct: float | None  # |coingecko - kraken| / mean, when both present
     coingecko_error: str | None
     kraken_error: str | None
+    # coin_from's own USD price, added 2026-09-19 (market_maker/next_steps.md #15
+    # Phase A) — the CoinGecko cross-rate computation below already fetches this;
+    # exposing it lets a caller (live_maker.py) compute a live USD notional without
+    # a second external call. None whenever coingecko_rate is None (the cross
+    # failed), even if a Kraken fallback rate is available.
+    usd_price_from: float | None = None
 
     @property
     def mid(self) -> float | None:
@@ -143,6 +149,31 @@ def get_usd_price(coin: str, timeout: float = 10.0) -> float:
         raise ExternalRateError(f"failed to fetch USD price for {coin}: {e}") from e
 
 
+def get_btc_usd_at(t: float, timeout: float = 10.0) -> float:
+    """BTC/USD at unix time t — Kraken XBTUSD hourly candle close for the hour
+    containing t. Added 2026-09-25 so fill_ledger.py can value a past fill in
+    USD at the price that held when it happened, not today's. Kraken only
+    serves the most recent 720 candles per interval, so this reaches back ~30
+    days; anything older (or any network/parse failure) raises
+    ExternalRateError."""
+    url = "https://api.kraken.com/0/public/OHLC?" + urllib.parse.urlencode(
+        {"pair": "XBTUSD", "interval": 60, "since": int(t) - 3600}
+    )
+    try:
+        data = _get_json(url, timeout)
+        if not isinstance(data, dict) or data.get("error"):
+            raise ExternalRateError(f"Kraken OHLC error: {data.get('error') if isinstance(data, dict) else data!r}")
+        candles = next(v for k, v in data["result"].items() if k != "last")
+    except ExternalRateError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise ExternalRateError(f"failed to fetch BTC/USD OHLC at {t}: {e}") from e
+    for c in candles:
+        if c[0] <= t < c[0] + 3600:
+            return float(c[4])
+    raise ExternalRateError(f"no Kraken XBTUSD hourly candle covers {t} (older than ~30 days?)")
+
+
 def get_reference_rate(coin_from: str, coin_to: str, timeout: float = 10.0) -> ReferenceRate:
     """coin_to-per-coin_from reference rate, independent of BasicSwap's own
     (currently broken) lookup. Never raises for a single source's failure — only
@@ -154,6 +185,7 @@ def get_reference_rate(coin_from: str, coin_to: str, timeout: float = 10.0) -> R
 
     coingecko_rate = None
     coingecko_error = None
+    usd_price_from = None
     try:
         id_from = _COINGECKO_IDS[coin_from]
         id_to = _COINGECKO_IDS[coin_to]
@@ -165,6 +197,7 @@ def get_reference_rate(coin_from: str, coin_to: str, timeout: float = 10.0) -> R
             price_from = usd_prices[id_from]
             price_to = usd_prices[id_to]
             coingecko_rate = price_from / price_to
+            usd_price_from = price_from
         except Exception as e:  # noqa: BLE001 - any network/parse failure degrades, doesn't raise
             coingecko_error = str(e)
 
@@ -204,4 +237,5 @@ def get_reference_rate(coin_from: str, coin_to: str, timeout: float = 10.0) -> R
         disagreement_pct=disagreement_pct,
         coingecko_error=coingecko_error,
         kraken_error=kraken_error,
+        usd_price_from=usd_price_from,
     )

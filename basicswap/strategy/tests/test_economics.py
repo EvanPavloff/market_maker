@@ -1,10 +1,15 @@
+import math
 import unittest
 
 from ..analysis import PairSummary
 from ..economics import (
+    ANNUALIZED_CROSS_VOL_PCT,
     CostAssumptions,
+    dynamic_half_spread_pct,
     evaluate_pair,
+    evaluate_pair_sats,
     expected_apy,
+    live_annualized_vol_pct,
     required_spread_pct,
     vol_buffer_pct_for_hours,
 )
@@ -150,6 +155,127 @@ class ExpectedApyTests(unittest.TestCase):
         verdict = self._verdict()
         apy = expected_apy(verdict, fills_per_year=52, scenario="today_1sigma")
         self.assertLessEqual(apy.risk_adjusted_edge_pct, apy.raw_edge_pct)
+
+
+class LiveAnnualizedVolPctTests(unittest.TestCase):
+    """market_maker/next_steps.md #15 Phase A."""
+
+    def test_matches_manual_sqrt_time_scaling(self):
+        # A 0.3% move over a 900s (15-minute) window.
+        result = live_annualized_vol_pct(0.003, 900.0)
+        window_years = 900.0 / (24 * 3600 * 365)
+        self.assertAlmostEqual(result, 0.003 / math.sqrt(window_years))
+
+    def test_zero_window_vol_is_zero_annualized(self):
+        self.assertEqual(live_annualized_vol_pct(0.0, 900.0), 0.0)
+
+    def test_rejects_non_positive_window(self):
+        with self.assertRaises(ValueError):
+            live_annualized_vol_pct(0.003, 0.0)
+
+    def test_roundtrips_through_vol_buffer_pct_for_hours(self):
+        # Scaling an annualized figure down to a window with vol_buffer_pct_for_hours
+        # and then back up with live_annualized_vol_pct should reproduce the input
+        # annualized vol -- the two functions are meant to be inverses of each other.
+        annualized = 0.90
+        hours = 6.0
+        buffer_pct = vol_buffer_pct_for_hours(hours, sigma=1, annualized_vol_pct=annualized)
+        self.assertAlmostEqual(
+            live_annualized_vol_pct(buffer_pct, hours * 3600), annualized
+        )
+
+
+class DynamicHalfSpreadPctTests(unittest.TestCase):
+    """market_maker/next_steps.md #15 Phase A."""
+
+    def test_never_returns_below_the_operator_floor(self):
+        # Calm/no volatility data -> required spread should be tiny relative to a
+        # generous floor, so the floor wins.
+        result = dynamic_half_spread_pct(
+            operator_floor_pct=0.5,  # absurdly high floor, guarantees it dominates
+            notional_usd=880.0,
+            lock_hours=2.5,
+            live_vol_pct=0.0022,
+            live_vol_window_seconds=900.0,
+        )
+        self.assertEqual(result, 0.5)
+
+    def test_high_volatility_widens_spread_above_the_floor(self):
+        low_vol = dynamic_half_spread_pct(
+            operator_floor_pct=0.02,
+            notional_usd=880.0,
+            lock_hours=2.5,
+            live_vol_pct=0.0022,  # ~p50 per volatility.py's real calibration
+            live_vol_window_seconds=900.0,
+        )
+        high_vol = dynamic_half_spread_pct(
+            operator_floor_pct=0.02,
+            notional_usd=880.0,
+            lock_hours=2.5,
+            live_vol_pct=0.0084,  # ~p99, just under the kill-switch's own default threshold
+            live_vol_window_seconds=900.0,
+        )
+        self.assertEqual(low_vol, 0.02)  # calm reading -> floor wins
+        self.assertGreater(high_vol, 0.02)  # elevated reading -> computed value wins
+
+    def test_no_live_vol_data_falls_back_to_static_annualized_assumption(self):
+        result = dynamic_half_spread_pct(
+            operator_floor_pct=0.0,  # floor of zero isolates the computed value
+            notional_usd=10_000.0,
+            lock_hours=24.0,
+            live_vol_pct=None,
+            live_vol_window_seconds=None,
+        )
+        assumptions = CostAssumptions()
+        fee_today = (
+            assumptions.fee_round_trip_usd_today_low + assumptions.fee_round_trip_usd_today_high
+        ) / 2
+        expected = required_spread_pct(
+            10_000.0,
+            fee_today,
+            vol_buffer_pct_for_hours(24.0, sigma=1, annualized_vol_pct=ANNUALIZED_CROSS_VOL_PCT),
+            assumptions.min_profit_margin_pct,
+        )
+        self.assertAlmostEqual(result, expected)
+
+    def test_rejects_non_positive_notional(self):
+        with self.assertRaises(ValueError):
+            dynamic_half_spread_pct(
+                operator_floor_pct=0.02,
+                notional_usd=0.0,
+                lock_hours=2.5,
+                live_vol_pct=None,
+                live_vol_window_seconds=None,
+            )
+
+
+
+class SatsNumeraireTests(unittest.TestCase):
+    def test_default_sats_fees_derived_from_vbytes(self):
+        a = CostAssumptions()
+        self.assertAlmostEqual(a.fee_round_trip_sats_today, (300 * 1 + 500 * 2) / 2)
+        self.assertAlmostEqual(a.fee_round_trip_sats_stressed, (300 * 25 + 500 * 2 * 50) / 2)
+
+    def test_sats_verdict_uses_sats_fee_over_sats_notional(self):
+        a = CostAssumptions()
+        verdict = evaluate_pair_sats(_summary(), notional_sats=800_000.0)
+        self.assertEqual(verdict.notional_unit, "sats")
+        expected = a.fee_round_trip_sats_today / 800_000.0 + a.vol_buffer_pct_1sigma_24h + a.min_profit_margin_pct
+        self.assertAlmostEqual(verdict.required_spread_pct["today_1sigma"], expected)
+
+    def test_sats_and_usd_verdicts_agree_at_matching_btc_price(self):
+        # 650 sats today-fee == $1.00 USD today-fee only at BTC/USD ~153,846 — at
+        # that price the two numeraires must give the same required spread.
+        a = CostAssumptions()
+        btc_usd = a.fee_round_trip_usd_today / (a.fee_round_trip_sats_today / 1e8)
+        sats = evaluate_pair_sats(_summary(), notional_sats=1_000_000.0)
+        usd = evaluate_pair(_summary(), notional_usd=0.01 * btc_usd)
+        self.assertAlmostEqual(sats.required_spread_pct["today_1sigma"], usd.required_spread_pct["today_1sigma"])
+
+    def test_expected_apy_on_sats_verdict_uses_sats_fee(self):
+        verdict = evaluate_pair_sats(_summary(median_spread_pct=0.03), notional_sats=650_000.0)
+        apy = expected_apy(verdict, fills_per_year=10)
+        self.assertAlmostEqual(apy.raw_edge_pct, 0.03 - 0.001)
 
 
 if __name__ == "__main__":

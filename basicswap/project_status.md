@@ -976,3 +976,185 @@ see `../TASKS.md`'s matching entry. Also fixed a harmless cosmetic bug
 found in the process command line this same check (`--live --live` duplicate
 flag in `restart_live_maker.sh`, since `run_live_maker.sh` already
 hardcodes it) — no behavior change, just confusing to read.
+
+## 2026-09-19: `half_spread_pct` raised 0.011 -> 0.02 (Evan's "fix the BS rate" call, `../next_steps.md` #14)
+
+**Found the previous 0.011 justification was itself miscalibrated**, not
+just "worth revisiting": it compared the round-trip-equivalent (2x half
+spread = 2.2%) against this market's own *two-sided* observed median
+spread (~2.05-2.09%) as the profitability bar. That's the wrong
+comparison for `live_maker.py`, which only ever exposes itself to ONE side
+of a fill at a time — the correct bar is `strategy/economics.py`'s
+already-built `required_spread_pct` (fee + lock-window vol buffer +
+margin) compared *directly* against `half_spread_pct`, not halved. Ran it
+at our real ~$880 ask notional with the module's own already-researched
+fee assumptions: even a fast 30-minute fill needs ~1.35% one-sided to
+break even with margin (already above the old 0.011), and a more
+realistic 2-3h fill (plausible given Monero's own confirmation
+requirements) needs ~2.0-2.3%. Independently corroborated by `../
+next_steps.md` #14's fresh cross-venue pull the same day: Eigen ASB's
+competitive tier runs a median 2.67% one-sided markup, Bisq a median
+4.64%. All three real fills to date have been losses. **0.02 was chosen
+as the new default** — above the realistic-fill-time cost-model bar,
+below Eigen ASB's professional-tier benchmark, a deliberate correction
+grounded in two independent methods converging on the same range, not a
+guess. Full reasoning is inline in `strategy/live_maker.py`'s own
+`--half-spread-pct` argparse comment (kept there deliberately, same
+convention as the 0.0066->0.011 change, so the number and its
+justification never drift apart).
+
+98/98 tests still passing (no test hardcoded the old default). **Deployed
+same session**: `./restart_live_maker.sh` run, both processes confirmed
+restarted with `half_spread_pct=0.0200` in their startup logs, ask side
+immediately reposted at the new, wider markup. Bid side still isn't
+posting — unrelated, pre-existing, deliberately-deferred reserve
+constraint from the entry above, unaffected by this change, not re-flagged.
+
+**Still an open question, not resolved by this change**: the real
+lock/fill time this whole calculation is most sensitive to
+(`next_steps.md` §4(a)/§5) is still unmeasured — 0.02 is a defensible
+correction given what's known today, not a final number. See
+`../next_steps.md` #15 for the roadmap toward a dynamic, data-driven
+replacement for this static default.
+
+## 2026-09-20: offer-size quantization (`amount_step`) — stolen from BasicSwap's own "AMM" bot, built and tested, NOT yet deployed
+
+Evan asked whether BasicSwap's built-in "AMM" offer-posting bot
+(`scripts/createoffers.py`, its own GUI page) had anything worth stealing for
+`strategy/live_maker.py`. It's not a liquidity-pool AMM — it's BasicSwap's own
+name for a config-templated version of what `live_maker.py` already does. Two
+things it does that we didn't were identified; see `next_steps.md` #9 for the
+full writeup of both, including why the second one (opportunistic bid-scanning
+— actively filling *other* makers' offers, not just posting our own) was scoped
+but deliberately NOT built this session pending Evan's explicit sign-off (a new
+real-capital write path, materially higher risk than this first item).
+
+**Built and tested (this entry): `LiveMakerConfig.amount_step` +
+`--amount-step`.** Only relevant to `--reserve-usd` sizing (our bid side):
+`_resolve_amount_from` was computing "wallet balance minus reserve" and
+offering that *exact* leftover value — which discloses the wallet's precise
+balance to anyone watching the offer book (offer_amount + reserve_usd/price ~=
+balance). `createoffers.py`'s own template docs call this out directly
+("amount_step: REQUIRED — Offer size increment for privacy"). When
+`--amount-step` is set, the dynamic amount is now quantized DOWN to the nearest
+whole multiple of it before ever reaching `decide_and_act` — replicated
+`createoffers.py`'s own `min_offer_amount * min_steps` rounding logic exactly.
+3 new tests (quantizes down correctly; `amount_step=None` preserves the old
+exact-leftover behavior unchanged; a step larger than the leftover returns
+`None`, same "leave any existing offer untouched" posture as every other
+nothing-to-offer path in this module) — 115/115 passing in `strategy/tests/`.
+
+**Deliberately opt-in, default `None` (disabled)** — matches this module's
+standing posture that a live-money behavior change needs Evan to actually pass
+the flag on a restart, not just have it built. **Not yet deployed**: the live
+bid-side process (`run_live_maker.sh --side bid --reserve-usd 210`) is still
+running without this flag; turning it on needs `restart_live_maker.sh` re-run
+with an added `--amount-step <value>` once Evan picks a step size. Moot for now
+in one sense — the bid side has had nothing free to offer every cycle since
+Evan's own deliberately-deferred reserve constraint (see the 2026-09-19 entry
+above), so no real amount has actually leaked yet — but worth turning on
+before that changes.
+
+## 2026-09-20: opportunistic bid-scanning (OBS) built, verified read-only against live data, NOT yet run with `--live`
+
+Follow-up to the entry above, same session. Evan said "go ahead and build"
+the opportunistic-bid-scanning idea `next_steps.md` #9 had scoped but
+deliberately not written code for, with one explicit added requirement:
+**"make sure we can audit the profitability of the opportunistic bid
+scanning (OBS) independently of our BS offers."**
+
+Full build detail (API research, module design, exact test list, the real
+dry-run verification against live BasicSwap data) is in `next_steps.md` #9's
+"Built 2026-09-20" section — summary here:
+
+- New write path: `api_client.post_bid()`/`get_bid()` (`POST /json/bids/new`
+  and `/json/bids/<id>`, found by reading `js_server.py`'s `js_bids` handler
+  and `createoffers.py`'s own `place_bid_on_offer()` directly, not guessed).
+- **Auditability requirement met via a dedicated `bid_scan_events` table**
+  (`storage.py`), kept separate from `live_quote_events` on purpose — every
+  row carries the *external* `reference_mid` (never anything from
+  BasicSwap's own offer book) alongside the offer's own posted rate, so
+  `edge_pct` is measured against an independent source. `bid_scanner.
+  reconcile_bid_outcomes()` polls each unresolved bid's real BidStates
+  outcome via `get_bid()` and updates `resolved`/`outcome` — this closes a
+  gap `live_maker.py`'s own docstring had explicitly flagged as un-built
+  ("for our OWN offers /json/bids could in principle answer this").
+- New `strategy/bid_scanner.py` (scan → size → bid → log, same guard
+  ordering as `live_maker.py`: source-disagreement gate, volatility
+  kill-switch, real funding check immediately before each bid; reuses
+  `economics.dynamic_half_spread_pct` rather than re-deriving a spread
+  floor) plus `run_bid_scanner.sh` (mirrors `run_live_maker.sh`'s
+  duplicate-instance lock-file guard).
+- 29 new tests, 144/144 passing across `strategy/tests/`.
+- **Verified against the real running node, read-only**: a dry run (no
+  `--live`) executed cleanly against the live API; a direct scan call
+  correctly parsed/filtered/sorted 6 of 9 real live BTC/XMR offers
+  (148.0–152.1 XMR/BTC that session). At the real default 0.02 floor
+  spread, none of today's real offers clear it — a pipeline-correctness
+  result consistent with this project's already-established "the real
+  market spread rarely clears the bar" finding, not a new negative signal
+  about OBS specifically.
+
+**Not run with `--live`** — submitting a real bid starts a real atomic swap
+and commits capital for its full duration to a counterparty we don't
+control, a materially different and less reversible action than posting/
+revoking our own offer (see `next_steps.md` #9's full risk writeup). Built
+and verified read-only only, same staged-rollout posture as every other
+live-capital escalation this project has made — next step is a first
+trivial `--live` run on Evan's explicit go-ahead.
+
+## 2026-09-24: CORRECTION to the 2026-09-18 "~6.7% below fair value" ask fill — it was a real market move, not a bad reading
+
+The 09-18 entry above says the 136.17 XMR/BTC ask was mispriced by a
+transient bad CoinGecko reading while "the poller's readings held 144.9–145.6
+through 11:50–12:35". The production DB says otherwise:
+`direct_rate_snapshots` shows CoinGecko **and** Kraken both at ~135–137
+XMR/BTC from 12:11 to 12:31 (disagreement ≤1.4%), and Kraken's own public
+15-min OHLC for XMRXBT shows the same dip (12:00 close 135.15, 12:15 close
+136.97 on 803 XMR volume — ~8x normal), reverting to ~145 by 13:15. The ask
+was priced correctly (+0.66% over a 135.28 mid) for the moment it was
+quoted; the fill itself was ~-0.24% vs mid. The real loss was adverse
+selection + inventory: the XMR we received was worth ~7% less an hour later
+(`fill_ledger.py` markouts: -0.24% @fill, -7.27% +1h, -5.31% +24h).
+Implications: #10's source-disagreement gate is still a sensible guard but
+wouldn't have prevented this; the gap is quoting through a fast directional
+move, and `volatility.py`'s "15-min p99 0.84%" calibration understates tails.
+
+## 2026-09-24: per-fill P&L ledger built (`strategy/fill_ledger.py`, next_steps #3/#4)
+
+Read-only. Syncs `/json/bids` (new `api_client.get_bids()`), keeps bids on
+offers `live_maker` posted (matched via `live_quote_events.offer_id`), writes a
+`fills` table (bid_state distinguishes Completed vs Expired — closes #4), and
+computes edge vs reference mid at fill, +1h and +24h (gross of network fees).
+`./run_fill_ledger.sh` to sync + report, `--report-only` to skip the API. 6 new
+tests, 150/150 passing. First real run: 2 Completed, 2 Expired; mean edge
+-0.51% @fill, -3.84% +1h, -2.14% +24h.
+
+**Not done — needs Evan**: launchd install for the BasicSwap poller (the
+hand-started `run_poller.sh --loop` silently died 2026-09-23 09:34 and isn't
+running) and an hourly fill-ledger sync. The Claude session's attempt to
+install LaunchAgents was blocked by the sandbox as persistence.
+
+## 2026-09-25: BTC-numeraire P&L (goal = accumulate BTC, not USD)
+
+Evan asked how the strategy changes if the goal is more BTC rather than more USD.
+Steps 1–2 of that plan are built. Nothing live changed: `live_maker.py` and
+`bid_scanner.py` still call the USD path.
+
+- `fill_ledger.py`: each completed fill now also shows sats gained or lost vs. fair
+  value (@fill/+1h/+24h, via `pnl_btc()`, derived from the stored edge so no schema
+  change), plus USD at that fill's own BTC/USD (`external_rates.get_btc_usd_at`,
+  Kraken hourly candles, reaches back ~30 days). A new section nets all completed
+  fills into a per-coin position change and marks it at today's XMR/BTC mid. That
+  sats number ("vs. never having traded") is what the BTC goal is scored on.
+- `economics.py`: `evaluate_pair_sats()` and a `--notional-sats` CLI flag. The BTC
+  round-trip fee is now in sats, derived from vbytes × sat/vB (650 today, 28,750
+  stressed). The vol buffer needed no change because it was already XMR/BTC cross vol.
+  `EconomicsVerdict.notional_usd` became `notional` + `notional_unit`.
+- 11 new tests, 183/183 passing.
+
+First real run (22 bids on own offers, 5 completed): −15,821 sats summed @fill over the
+4 fills that have an edge (−$13.04), −69,293 sats at +1h. Net position change marked
+today: +0.00089421 BTC, −0.22940356 XMR = **−62,660 sats (−$52.63)**. The 09-25 06:58
+completed ask shows n/a because the observation poller has been dead since 09-23 09:34
+(see TASKS.md).

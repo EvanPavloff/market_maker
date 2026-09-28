@@ -16,5 +16,12 @@ class ToDisplayNameTests(unittest.TestCase):
         self.assertEqual(coin_names.to_display_name("SomeNewCoin"), "SomeNewCoin")
 
 
+
+    def test_to_ticker_inverts_display_name(self):
+        self.assertEqual(coin_names.to_ticker("Monero"), "xmr")
+        self.assertEqual(coin_names.to_ticker("xmr"), "xmr")
+        self.assertEqual(coin_names.to_ticker("SomeNewCoin"), "somenewcoin")
+
+
 if __name__ == "__main__":
     unittest.main()

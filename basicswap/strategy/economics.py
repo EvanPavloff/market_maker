@@ -61,6 +61,18 @@ class CostAssumptions:
     fee_round_trip_usd_stressed_low: float = 15.0
     fee_round_trip_usd_stressed_high: float = 75.0
 
+    # Same BTC round-trip fee in its native unit (added 2026-09-25 for the
+    # accumulate-BTC goal — BTC network fees are paid in sats, so a sats
+    # numeraire shouldn't route them through a USD price). Derived from the
+    # same §4 inputs the USD figures above summarize: ~300-500 vbytes per
+    # round trip at today's ~1-2 sat/vB, stressed = 25-50x that.
+    btc_round_trip_vbytes_low: float = 300.0
+    btc_round_trip_vbytes_high: float = 500.0
+    sat_per_vb_today_low: float = 1.0
+    sat_per_vb_today_high: float = 2.0
+    stressed_fee_multiplier_low: float = 25.0
+    stressed_fee_multiplier_high: float = 50.0
+
     # XMR/BTC cross volatility over BasicSwap's 24h UI lock-window ceiling
     # (actual observed lock times are likely well under this, but unmeasured
     # until a real swap runs — see next_steps.md §4/§5). ~85-95% annualized
@@ -79,6 +91,29 @@ class CostAssumptions:
     min_two_sided_fraction: float = 0.5
 
 
+    @property
+    def fee_round_trip_sats_today(self) -> float:
+        """Midpoint of the today range: (300*1 + 500*2) / 2 = 650 sats by default."""
+        low = self.btc_round_trip_vbytes_low * self.sat_per_vb_today_low
+        high = self.btc_round_trip_vbytes_high * self.sat_per_vb_today_high
+        return (low + high) / 2
+
+    @property
+    def fee_round_trip_sats_stressed(self) -> float:
+        """Midpoint of the stressed range: (300*1*25 + 500*2*50) / 2 = 28,750 sats by default."""
+        low = self.btc_round_trip_vbytes_low * self.sat_per_vb_today_low * self.stressed_fee_multiplier_low
+        high = self.btc_round_trip_vbytes_high * self.sat_per_vb_today_high * self.stressed_fee_multiplier_high
+        return (low + high) / 2
+
+    @property
+    def fee_round_trip_usd_today(self) -> float:
+        return (self.fee_round_trip_usd_today_low + self.fee_round_trip_usd_today_high) / 2
+
+    @property
+    def fee_round_trip_usd_stressed(self) -> float:
+        return (self.fee_round_trip_usd_stressed_low + self.fee_round_trip_usd_stressed_high) / 2
+
+
 DEFAULT_ASSUMPTIONS = CostAssumptions()
 
 
@@ -91,18 +126,75 @@ def required_spread_pct(
     """The minimum spread (as a fraction, e.g. 0.02 = 2%) a market maker would
     need to realize on this notional to cover the fee, the price-risk buffer,
     and the desired margin. Pure arithmetic — see module docstring for the
-    bar this compares against."""
+    bar this compares against. Unit-agnostic despite the names: notional and
+    fee just have to share a unit (evaluate_pair_sats passes both in sats)."""
     if notional_usd <= 0:
         raise ValueError(f"notional_usd must be positive, got {notional_usd}")
     fee_pct = fee_round_trip_usd / notional_usd
     return fee_pct + vol_buffer_pct + min_margin_pct
 
 
+def live_annualized_vol_pct(window_vol_pct: float, window_seconds: float) -> float:
+    """market_maker/next_steps.md #15 Phase A: extrapolates volatility.py's
+    VolatilityMonitor rolling-window reading ((max-min)/mean over window_seconds,
+    already computed every live_maker cycle for the kill-switch) to an
+    annualized-vol-equivalent, using the same sqrt-time convention
+    vol_buffer_pct_for_hours already uses to scale an annualized figure *down* to a
+    shorter window -- this runs that scaling in reverse. A range-based estimator
+    standing in for a stdev-based one, same documented approximation volatility.py's
+    kill-switch already relies on (calibrated against real percentiles, not a
+    rigorous vol model) -- good enough to tell "louder than usual right now" apart
+    from "calm," not a precision instrument."""
+    if window_seconds <= 0:
+        raise ValueError(f"window_seconds must be positive, got {window_seconds}")
+    window_years = window_seconds / (24 * 3600 * 365)
+    return window_vol_pct / math.sqrt(window_years)
+
+
+def dynamic_half_spread_pct(
+    operator_floor_pct: float,
+    notional_usd: float,
+    lock_hours: float,
+    live_vol_pct: float | None,
+    live_vol_window_seconds: float | None,
+    assumptions: CostAssumptions = DEFAULT_ASSUMPTIONS,
+    sigma: float = 1.0,
+) -> float:
+    """market_maker/next_steps.md #15 Phase A: live_maker.py's per-cycle computed
+    half_spread_pct, composing a live volatility reading with this module's
+    already-built cost model instead of quoting at a static, hand-edited CLI
+    default every cycle regardless of current conditions (next_steps.md #14's fix
+    was the last hand-edit of that kind). `operator_floor_pct` is read as a floor,
+    never a target -- the result never drops below it, even when live inputs would
+    otherwise justify a thinner number, matching this project's standing
+    fail-safe-toward-caution posture (the kill-switch/disagreement gate are the
+    same shape: always more conservative, never less, on their own initiative).
+
+    `lock_hours` here is an assumed exposure window (still a static guess pending
+    next_steps.md #15 Phase C's real fill-time measurement), NOT
+    LiveMakerConfig.lock_hours (the offer's technical HTLC ceiling passed to
+    post_offer) -- the two are unrelated numbers that happen to share a name
+    across modules. Uses "today" (not "stressed") fees and sigma=1 by default,
+    matching next_steps.md #14's own 0.02 derivation and this project's existing
+    today_1sigma default scenario elsewhere."""
+    if notional_usd <= 0:
+        raise ValueError(f"notional_usd must be positive, got {notional_usd}")
+    fee_usd = assumptions.fee_round_trip_usd_today
+    if live_vol_pct is not None and live_vol_window_seconds:
+        annualized_vol_pct = live_annualized_vol_pct(live_vol_pct, live_vol_window_seconds)
+    else:
+        annualized_vol_pct = ANNUALIZED_CROSS_VOL_PCT
+    vol_buffer = vol_buffer_pct_for_hours(lock_hours, sigma, annualized_vol_pct)
+    required = required_spread_pct(notional_usd, fee_usd, vol_buffer, assumptions.min_profit_margin_pct)
+    return max(operator_floor_pct, required)
+
+
 @dataclass
 class EconomicsVerdict:
     coin_from: str
     coin_to: str
-    notional_usd: float
+    notional: float
+    notional_unit: str  # "usd" or "sats" — the unit notional and the fee were compared in
     n_polls: int
     two_sided_fraction: float
     observed_median_spread_pct: float | None
@@ -122,7 +214,7 @@ def evaluate_pair(
     assumptions: CostAssumptions = DEFAULT_ASSUMPTIONS,
     lock_hours: float | None = None,
 ) -> EconomicsVerdict:
-    """Compare `summary` (from analysis.summarize_pair) against the go/no-go bar
+    """USD-numeraire verdict. Compare `summary` (from analysis.summarize_pair) against the go/no-go bar
     across both fee scenarios and both volatility-buffer sizings. Uses the
     *median* observed spread, not the mean — one favorable outlier poll
     shouldn't carry the verdict (next_steps.md's "sustained ... not a one-off
@@ -134,6 +226,40 @@ def evaluate_pair(
     instead via `vol_buffer_pct_for_hours` — this is what next_steps.md's
     "Real test swap completed" section re-ran by hand; passing it here makes
     that a repeatable call instead of one-off arithmetic."""
+    return _evaluate(
+        summary, notional_usd, "usd",
+        assumptions.fee_round_trip_usd_today, assumptions.fee_round_trip_usd_stressed,
+        assumptions, lock_hours,
+    )
+
+
+def evaluate_pair_sats(
+    summary: PairSummary,
+    notional_sats: float,
+    assumptions: CostAssumptions = DEFAULT_ASSUMPTIONS,
+    lock_hours: float | None = None,
+) -> EconomicsVerdict:
+    """BTC-numeraire verdict (goal = accumulate BTC). Same bar as evaluate_pair,
+    with the notional and the BTC network fee both in sats, so no BTC/USD
+    price enters the comparison. The vol buffer needs no conversion: it was
+    always XMR/BTC cross vol (ANNUALIZED_CROSS_VOL_PCT), which is exactly the
+    only price risk a BTC-denominated holder carries."""
+    return _evaluate(
+        summary, notional_sats, "sats",
+        assumptions.fee_round_trip_sats_today, assumptions.fee_round_trip_sats_stressed,
+        assumptions, lock_hours,
+    )
+
+
+def _evaluate(
+    summary: PairSummary,
+    notional: float,
+    notional_unit: str,
+    fee_today: float,
+    fee_stressed: float,
+    assumptions: CostAssumptions,
+    lock_hours: float | None,
+) -> EconomicsVerdict:
     notes: list[str] = []
 
     if summary.n_polls == 0:
@@ -164,28 +290,16 @@ def evaluate_pair(
         )
 
     scenarios = {
-        "today_1sigma": (
-            (assumptions.fee_round_trip_usd_today_low + assumptions.fee_round_trip_usd_today_high) / 2,
-            vol_1sigma,
-        ),
-        "today_2sigma": (
-            (assumptions.fee_round_trip_usd_today_low + assumptions.fee_round_trip_usd_today_high) / 2,
-            vol_2sigma,
-        ),
-        "stressed_1sigma": (
-            (assumptions.fee_round_trip_usd_stressed_low + assumptions.fee_round_trip_usd_stressed_high) / 2,
-            vol_1sigma,
-        ),
-        "stressed_2sigma": (
-            (assumptions.fee_round_trip_usd_stressed_low + assumptions.fee_round_trip_usd_stressed_high) / 2,
-            vol_2sigma,
-        ),
+        "today_1sigma": (fee_today, vol_1sigma),
+        "today_2sigma": (fee_today, vol_2sigma),
+        "stressed_1sigma": (fee_stressed, vol_1sigma),
+        "stressed_2sigma": (fee_stressed, vol_2sigma),
     }
 
     required: dict[str, float] = {}
     clears: dict[str, bool | None] = {}
-    for key, (fee_usd, vol_pct) in scenarios.items():
-        req = required_spread_pct(notional_usd, fee_usd, vol_pct, assumptions.min_profit_margin_pct)
+    for key, (fee, vol_pct) in scenarios.items():
+        req = required_spread_pct(notional, fee, vol_pct, assumptions.min_profit_margin_pct)
         required[key] = req
         if summary.median_spread_pct is None:
             clears[key] = None
@@ -195,7 +309,8 @@ def evaluate_pair(
     return EconomicsVerdict(
         coin_from=summary.coin_from,
         coin_to=summary.coin_to,
-        notional_usd=notional_usd,
+        notional=notional,
+        notional_unit=notional_unit,
         n_polls=summary.n_polls,
         two_sided_fraction=summary.two_sided_fraction,
         observed_median_spread_pct=summary.median_spread_pct,
@@ -258,12 +373,12 @@ def expected_apy(
             f"unknown scenario {scenario!r}, choose from {sorted(verdict.required_spread_pct)}"
         )
 
-    fee_usd = (
-        (assumptions.fee_round_trip_usd_today_low + assumptions.fee_round_trip_usd_today_high) / 2
-        if scenario.startswith("today")
-        else (assumptions.fee_round_trip_usd_stressed_low + assumptions.fee_round_trip_usd_stressed_high) / 2
-    )
-    fee_pct = fee_usd / verdict.notional_usd
+    today = scenario.startswith("today")
+    if verdict.notional_unit == "sats":
+        fee = assumptions.fee_round_trip_sats_today if today else assumptions.fee_round_trip_sats_stressed
+    else:
+        fee = assumptions.fee_round_trip_usd_today if today else assumptions.fee_round_trip_usd_stressed
+    fee_pct = fee / verdict.notional
 
     raw_edge_pct = verdict.observed_median_spread_pct - fee_pct
     risk_adjusted_edge_pct = verdict.observed_median_spread_pct - verdict.required_spread_pct[scenario]
@@ -291,7 +406,8 @@ def format_expected_apy(a: ExpectedAPY) -> str:
 
 
 def format_verdict(v: EconomicsVerdict) -> str:
-    lines = [f"{v.coin_from}/{v.coin_to} @ ${v.notional_usd:,.0f} notional, {v.n_polls} poll(s):"]
+    size = f"{v.notional:,.0f} sats" if v.notional_unit == "sats" else f"${v.notional:,.0f}"
+    lines = [f"{v.coin_from}/{v.coin_to} @ {size} notional, {v.n_polls} poll(s):"]
     if v.observed_median_spread_pct is None:
         lines.append("  no two-sided data yet — no verdict possible")
     else:
@@ -307,6 +423,7 @@ def format_verdict(v: EconomicsVerdict) -> str:
 
 def main() -> None:
     """CLI: python -m strategy.economics --notional-usd 1000 [--notional-usd 100 ...]
+    or --notional-sats 800000 [...] for the BTC-numeraire verdict
     (reads config for db_path/pairs, matching analysis.py's convention)."""
     import argparse
 
@@ -321,6 +438,14 @@ def main() -> None:
         action="append",
         default=None,
         help="offer notional in USD to evaluate against (repeatable). Default: 100, 1000, 10000",
+    )
+    parser.add_argument(
+        "--notional-sats",
+        type=float,
+        action="append",
+        default=None,
+        help="evaluate in BTC numeraire at this notional in sats (repeatable); "
+        "fees compared in sats, no BTC/USD price used. Replaces the USD default when given",
     )
     parser.add_argument(
         "--lock-hours",
@@ -344,7 +469,10 @@ def main() -> None:
         help="which required-spread scenario to use for the risk-adjusted APY column",
     )
     args = parser.parse_args()
-    notionals = args.notional_usd or [100.0, 1000.0, 10000.0]
+    if args.notional_sats:
+        runs = [(evaluate_pair_sats, n) for n in args.notional_sats]
+    else:
+        runs = [(evaluate_pair, n) for n in (args.notional_usd or [100.0, 1000.0, 10000.0])]
 
     config = load_config()
     conn = storage.connect(config.db_path)
@@ -352,8 +480,8 @@ def main() -> None:
         display_from = coin_names.to_display_name(coin_from)
         display_to = coin_names.to_display_name(coin_to)
         summary = summarize_pair(conn, display_from, display_to)
-        for notional_usd in notionals:
-            verdict = evaluate_pair(summary, notional_usd, lock_hours=args.lock_hours)
+        for evaluate, notional in runs:
+            verdict = evaluate(summary, notional, lock_hours=args.lock_hours)
             print(format_verdict(verdict))
             if args.fills_per_year and not verdict.insufficient_data:
                 print("  --- expected APR/APY sensitivity (§7 — fills_per_year is an assumption, not a measurement) ---")
