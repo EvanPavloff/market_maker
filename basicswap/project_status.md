@@ -1260,3 +1260,10 @@ proof step needs. Built, 226/226 `strategy/tests` pass (20 new). Nothing live ch
 - `restart_live_maker_btc.sh` writes the trial-start marker on first run and
   documents the optional seed.
 - Small fix: `--amount-step` quantization was float-unsafe (0.6/0.05 floored to 11 steps).
+
+## 2026-09-28, 15:21: sell-leg seed top-up completed
+
+On Evan's explicit go-ahead: bid `000000006abab37a…` bought 0.59649627 XMR for ~0.00398 BTC at
++3.28% over mid (~13k sats seed cost; the dry run's 2.69% offer was gone at submit time).
+Placed 14:35, Completed 15:21. Wallet: 0.98497 XMR, 0.00388973 BTC. The trial is not started
+yet; see `../HANDOFF_2026-09-28.md`.
