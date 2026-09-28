@@ -154,5 +154,26 @@ class TestKrakenTickerParsing(unittest.TestCase):
                 external_rates._kraken_ticker_rate("XMRXBT", timeout=5.0)
 
 
+class KrakenBookTests(unittest.TestCase):
+    def test_walks_asks_for_buy_cost(self):
+        from ..external_rates import parse_kraken_book
+
+        data = {"error": [], "result": {"XXMRXXBT": {
+            "asks": [["0.0065", "1.0", 0], ["0.0066", "10.0", 0]],
+            "bids": [["0.0064", "5.0", 0]],
+        }}}
+        book = parse_kraken_book(data, (1.0, 2.0, 50.0))
+        mid = 0.00645
+        self.assertAlmostEqual(book.buy_cost_pct[1.0], 0.0065 / mid - 1)
+        self.assertAlmostEqual(book.buy_cost_pct[2.0], (0.0065 + 0.0066) / 2 / mid - 1)
+        self.assertIsNone(book.buy_cost_pct[50.0])
+
+    def test_error_raises(self):
+        from ..external_rates import ExternalRateError, parse_kraken_book
+
+        with self.assertRaises(ExternalRateError):
+            parse_kraken_book({"error": ["EQuery:Unknown asset pair"]}, (1.0,))
+
+
 if __name__ == "__main__":
     unittest.main()

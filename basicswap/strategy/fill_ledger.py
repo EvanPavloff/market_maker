@@ -44,6 +44,7 @@ MAX_REF_GAP_SECONDS = 20 * 60
 MARKOUT_HORIZONS = {"1h": 3600, "24h": 86400}
 SATS_PER_BTC = 100_000_000
 BTC = "Bitcoin"
+TAKER = "taker"  # fills.side for a bid we SENT into someone else's offer
 
 
 def _nearest(rows: list[tuple[float, float]], t: float) -> float | None:
@@ -110,11 +111,12 @@ def pnl_btc(coin_from: str, coin_to: str, amount_from: float, amount_to: float, 
     return None
 
 
-def net_flows(rows) -> dict[str, float]:
-    """Per-coin position change summed over Completed fills (display-name keyed)."""
+def net_flows(rows, include_taker: bool = True) -> dict[str, float]:
+    """Per-coin position change summed over Completed fills (display-name keyed).
+    include_taker=False leaves out bids we sent (side 'taker')."""
     flows: dict[str, float] = {}
     for r in rows:
-        if r["bid_state"] != "Completed":
+        if r["bid_state"] != "Completed" or (not include_taker and r["side"] == TAKER):
             continue
         flows[r["coin_from"]] = flows.get(r["coin_from"], 0.0) - r["amount_from"]
         flows[r["coin_to"]] = flows.get(r["coin_to"], 0.0) + r["amount_to"]
@@ -158,6 +160,37 @@ def sync(conn: sqlite3.Connection, bids: list[dict], now: float | None = None) -
     return n
 
 
+def sync_sent(conn: sqlite3.Connection, sent_bids: list[dict], now: float | None = None) -> int:
+    """Same as sync() for bids we SENT (topup_xmr.py, bid_scanner.py), stored with
+    side='taker'. A sent bid carries the offer's direction, so it's flipped
+    here: we gave the offer's amount_to of its coin_to and received its
+    amount_from of its coin_from. Added 2026-09-28: before this, the BTC score
+    left out every coin we bought by taking someone else's offer."""
+    now = time.time() if now is None else now
+    n = 0
+    for b in sent_bids:
+        gave, got = b["coin_to"], b["coin_from"]
+        a_gave, a_got = float(b["amount_to"]), float(b["amount_from"])
+        t = float(b["created_at"])
+        completed = b.get("bid_state") == "Completed"
+        mid = reference_mid(conn, t, gave, got) if completed else None
+        marks = {}
+        for label, dt in MARKOUT_HORIZONS.items():
+            m = reference_mid(conn, t + dt, gave, got) if completed and now >= t + dt else None
+            marks[label] = edge_pct(a_gave, a_got, m)
+        storage.upsert_fill(
+            conn,
+            bid_id=b["bid_id"], offer_id=b["offer_id"], venue="basicswap", side=TAKER,
+            coin_from=to_display_name(gave), coin_to=to_display_name(got),
+            amount_from=a_gave, amount_to=a_got, rate=float(b["bid_rate"]),
+            bid_state=b.get("bid_state", ""), bid_created_at=t,
+            reference_mid_at_fill=mid, edge_pct_at_fill=edge_pct(a_gave, a_got, mid),
+            markout_1h_pct=marks["1h"], markout_24h_pct=marks["24h"], synced_at=now,
+        )
+        n += 1
+    return n
+
+
 def _fmt(p: float | None) -> str:
     return "     n/a" if p is None else f"{p * 100:+7.2f}%"
 
@@ -194,7 +227,8 @@ def report(
     states: dict[str, int] = {}
     for r in rows:
         states[r["bid_state"]] = states.get(r["bid_state"], 0) + 1
-    lines.append(f"\nbids on own offers: {len(rows)}  by state: {states}")
+    n_taker = sum(r["side"] == TAKER for r in rows)
+    lines.append(f"\nbids on own offers: {len(rows) - n_taker}, bids we sent: {n_taker}  by state: {states}")
     for key, label in (("edge_pct_at_fill", "@fill"), ("markout_1h_pct", "+1h"), ("markout_24h_pct", "+24h")):
         vals = [r[key] for r in done if r[key] is not None]
         if vals:
@@ -232,27 +266,40 @@ def report(
     if usd_total:
         lines.append(f"total USD  @fill over {len(usd_total)} fill(s): {_usd(sum(usd_total))}  (each fill at its own BTC/USD)")
 
-    flows = net_flows(rows)
-    if flows:
-        lines.append("\n--- Net position change from completed fills (vs. never having traded) ---")
-        marked, missing = 0.0, False
+    for include_taker, title in (
+        (False, "Net position change from completed fills on OUR offers (vs. never having traded)"),
+        (True, "Same, including bids we sent (top-ups, bid_scanner; the 09-17 test swap is the reserve's original purchase)"),
+    ):
+        if include_taker and not n_taker:
+            continue
+        flows = net_flows(rows, include_taker=include_taker)
+        if not flows:
+            continue
+        lines.append(f"\n--- {title} ---")
+        marked = mark_to_btc(flows, btc_per_coin_now)
         for coin, qty in sorted(flows.items()):
-            if coin == BTC:
-                btc_val: float | None = qty
-            else:
-                p = (btc_per_coin_now or {}).get(coin)
-                btc_val = qty * p if p is not None else None
+            btc_val = qty if coin == BTC else (qty * btc_per_coin_now[coin] if coin in (btc_per_coin_now or {}) else None)
             lines.append(f"  {coin:8} {qty:+.8f}  = {_sats(btc_val).strip()} sats at today's price")
-            if btc_val is None:
-                missing = True
-            else:
-                marked += btc_val
-        if missing:
+        if marked is None:
             lines.append("  net: n/a (no current price for every coin)")
         else:
             usd = f"  ({_usd(marked * btc_usd_now)} at BTC/USD {btc_usd_now:,.0f})" if btc_usd_now else ""
             lines.append(f"  net: {marked * SATS_PER_BTC:+,.0f} sats{usd}")
     return "\n".join(lines)
+
+
+def mark_to_btc(flows: dict[str, float], btc_per_coin_now: dict[str, float] | None) -> float | None:
+    """Net BTC value of a per-coin position change at today's prices; None if any
+    non-BTC coin has no current price."""
+    total = 0.0
+    for coin, qty in flows.items():
+        if coin == BTC:
+            total += qty
+        elif coin in (btc_per_coin_now or {}):
+            total += qty * btc_per_coin_now[coin]
+        else:
+            return None
+    return total
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -262,8 +309,10 @@ def main(argv: list[str] | None = None) -> int:
     cfg = load_config()
     conn = storage.connect(cfg.db_path)
     if not args.report_only:
-        n = sync(conn, BasicSwapClient(cfg.api_url).get_bids())
-        print(f"synced {n} bid(s) on own offers")
+        client = BasicSwapClient(cfg.api_url)
+        n = sync(conn, client.get_bids())
+        m = sync_sent(conn, client.get_sent_bids())
+        print(f"synced {n} bid(s) on own offers, {m} bid(s) we sent")
     from . import external_rates
 
     btc_per_coin_now: dict[str, float] = {}

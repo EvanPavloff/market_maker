@@ -24,8 +24,21 @@ not duplicated, unless this level changes their priority.
 | 13 | Eigen ASB read-only discovery (venue #3, observation-only) | **DONE, DEPLOYED, 2026-09-19**: same shape as #12 (Bisq) — `libp2p` bumped, `venues/eigen_asb/` built (29/29 tests), scheduled via the existing poller (no new plist needed), verified writing real rows into production `~/coinswaps/venue_observations.db` on its own natural cycle |
 | 14 | Cross-venue spread/size analysis ("what can we learn from others' offers") | **DONE, ACTED ON, 2026-09-19** — corrected an apples-to-oranges comparison, cross-checked against `economics.py`'s cost model, `half_spread_pct` raised 0.011→0.02 on Evan's "fix the BS rate" call, deployed and verified |
 | 15 | Dynamic, cross-venue-aware pricing roadmap | Phase A **DONE, DEPLOYED, 2026-09-19**; Phases B–D still not started |
+| 16 | Opportunistic bid-scanning | Built/tested 2026-09-20, not run with `--live` |
+| 17 | Accumulate-BTC proof trial + success bar | **BUILT 2026-09-28** — `proof_report.py`, Kraken book snapshots, sent-bid ledger; trial starts when Evan runs `restart_live_maker_btc.sh` |
 
 ## Available to pick up right now (no human decision needed first)
+
+**2026-09-28, later (read this first)**: #17's proof trial and success bar are
+built (226/226 tests). Starting it takes Evan: optionally seed the sell stock, then run
+`basicswap/restart_live_maker_btc.sh`. Score it with `strategy/proof_report.py`.
+
+**2026-09-28**: the accumulate-BTC retarget is built
+(`--objective btc`, restock-priced ask + target-premium sell leg + XMR inventory
+target, 206/206 tests), and `basicswap/restart_live_maker_btc.sh` is ready. It is
+**not deployed**, because a live-pricing change needs Evan's go-ahead. Launchd
+plists for the BasicSwap poller and fill ledger are written but not installed. See
+`project_status.md`'s 2026-09-28 handoff for the ordered list.
 
 **2026-09-24, later**: handoff items 4 (kill-switch long window + cooldown:
 built, 159/159 tests, awaiting `restart_live_maker.sh`) and 5 (Bisq trade flow:
@@ -1544,6 +1557,49 @@ needs Evan's explicit go-ahead, same gating posture as every other
 live-capital escalation in this project (the first live offer, the first
 trivial test swap, the volatility kill-switch). Don't redo this build; the
 next action here is a live decision, not more code.
+
+## 17. Accumulate-BTC proof trial + success bar `[BUILT 2026-09-28, trial not started]`
+
+**The question the trial answers:** will anyone buy our XMR at a premium often
+enough, and at a good enough price, that restocking it on Kraken would net BTC?
+Kraken only fixes the restock side, so it's worth setting up only if the sell side
+fills. Scored by `basicswap/strategy/proof_report.py` from the day
+`restart_live_maker_btc.sh` first runs (it writes `~/coinswaps/proof_trial_start`).
+
+**Setup:** `--objective btc` (see `basicswap/project_status.md`
+2026-09-28): sell XMR at +1.8% above a 0.385 XMR reserve; restock as a maker at
+about +0.4–0.6%, up to 0.985 XMR total. Optional one-time seed of the 0.6 XMR
+working stock via `topup_xmr.py --target-xmr 0.985` (about +3% on 09-28, ~11.7k
+sats), so the sell leg is tested from day one rather than after a rare restock fill.
+
+**Metrics** (per trial window; all in `proof_report.py`):
+- Sell-leg uptime and best-price share (offer_snapshots). Below 50% uptime the
+  verdict is INCONCLUSIVE: a fill rate means nothing if the offer wasn't up.
+- Sell fills per week.
+- Kraken-restock margin per sell fill = edge vs. the mid at +1h (a realistic
+  buy-back time) − Kraken depth cost at fill time (new `kraken_book_snapshots`,
+  written by the poller) − 0.40% Kraken fee (assumed) − ~1,650 sats network and
+  transfer fees (partly assumed).
+- Restock-leg fills and their edge: if these come regularly and cheaply, Kraken
+  may not be needed.
+- Net sats vs. never trading over the window, including bids we sent.
+
+**The bar** (minimum 4 weeks; PROVISIONAL before that):
+
+| Verdict | Condition | What it means | Next step |
+|---|---|---|---|
+| PESSIMISTIC | < 0.5 sell fills/week, or mean margin ≤ 0 over ≥ 4 fills | a $5k pot loses money or makes ~nothing | drop the Kraken plan; decide whether to retire the desk |
+| BASE | anything between | ~$100–300/yr at $5k | keep running small; Kraken not worth the setup |
+| OPTIMISTIC | ≥ 2 sell fills/week AND ≥ 8 fills AND mean margin ≥ 0.8% | ~$2k/yr at $5k if the fill rate holds at larger size | Kraken account + API key (Evan), then size the capital |
+| INCONCLUSIVE | sell offer live < 50% of cycles | the sell leg wasn't really tested | fix stock/uptime, extend the trial |
+
+The report also prints a $/yr projection for a $5k pot (fill rate × $2,500 per fill
+× mean margin). That assumes the fill rate holds at 5–10× our current size, which is
+optimistic, so read it as a ceiling.
+
+**Run:** `./run_fill_ledger.sh` (syncs fills, including sent bids), then
+`python3 -m strategy.proof_report` from `basicswap/`. The fill-ledger launchd job
+does the sync hourly once it's installed.
 
 ## Explicitly not on this list
 

@@ -11,6 +11,8 @@ from ..economics import (
     expected_apy,
     live_annualized_vol_pct,
     required_spread_pct,
+    restock_half_spread_pct,
+    sell_leg_half_spread_pct,
     vol_buffer_pct_for_hours,
 )
 
@@ -276,6 +278,45 @@ class SatsNumeraireTests(unittest.TestCase):
         verdict = evaluate_pair_sats(_summary(median_spread_pct=0.03), notional_sats=650_000.0)
         apy = expected_apy(verdict, fills_per_year=10)
         self.assertAlmostEqual(apy.raw_edge_pct, 0.03 - 0.001)
+
+
+class BtcObjectiveSpreadTests(unittest.TestCase):
+    """2026-09-28 accumulate-BTC objective: sats-native spread + restock pricing."""
+
+    VOL_2_5H = ANNUALIZED_CROSS_VOL_PCT * math.sqrt(2.5 / (24 * 365))
+
+    def test_sell_leg_quotes_target_premium_at_baseline_vol(self):
+        self.assertEqual(sell_leg_half_spread_pct(0.018, 2.5, None, None), 0.018)
+
+    def test_sell_leg_never_narrows_below_target_when_calm(self):
+        self.assertEqual(sell_leg_half_spread_pct(0.018, 2.5, 0.0001, 900), 0.018)
+
+    def test_sell_leg_widens_by_excess_vol_only(self):
+        live = live_annualized_vol_pct(0.02, 900)
+        excess = vol_buffer_pct_for_hours(2.5, 1.0, live) - self.VOL_2_5H
+        self.assertAlmostEqual(sell_leg_half_spread_pct(0.018, 2.5, 0.02, 900), 0.018 + excess)
+
+    def test_round_trip_charged_once_across_both_legs(self):
+        premium = 0.018
+        sell = sell_leg_half_spread_pct(premium, 2.5, None, None)
+        restock = restock_half_spread_pct(0.0001, 800_000, 2.5, premium, None, None)
+        self.assertAlmostEqual(sell + restock, 2 * 650 / 800_000 + self.VOL_2_5H + 0.005)
+
+    def test_restock_without_premium_must_cover_two_fees_alone(self):
+        got = restock_half_spread_pct(0.0025, 800_000, 2.5, 0.0, None, None)
+        self.assertAlmostEqual(got, 2 * 650 / 800_000 + self.VOL_2_5H + 0.005)
+
+    def test_restock_credits_expected_sell_premium(self):
+        full = restock_half_spread_pct(0.0001, 800_000, 2.5, 0.0, None, None)
+        got = restock_half_spread_pct(0.0001, 800_000, 2.5, 0.018, None, None)
+        self.assertAlmostEqual(got, full - 0.018)
+
+    def test_restock_floored_when_premium_covers_everything(self):
+        self.assertEqual(restock_half_spread_pct(0.0025, 800_000, 2.5, 0.10, None, None), 0.0025)
+
+    def test_restock_rejects_nonpositive_notional(self):
+        with self.assertRaises(ValueError):
+            restock_half_spread_pct(0.0025, 0, 2.5, 0.0, None, None)
 
 
 if __name__ == "__main__":

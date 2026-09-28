@@ -175,6 +175,20 @@ CREATE TABLE IF NOT EXISTS fills (
     markout_24h_pct REAL,
     synced_at REAL NOT NULL
 );
+
+-- Kraken XMR/BTC top of book per poll (2026-09-28, proof step): what
+-- restocking XMR on Kraken would have cost at any fill time. BTC per XMR;
+-- buy_cost_*_pct = average fill price for that XMR size / mid - 1, before
+-- Kraken's trading fee. NULL = not enough depth in the fetched levels.
+CREATE TABLE IF NOT EXISTS kraken_book_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    polled_at REAL NOT NULL,
+    best_bid REAL NOT NULL,
+    best_ask REAL NOT NULL,
+    buy_cost_1xmr_pct REAL,
+    buy_cost_5xmr_pct REAL
+);
+CREATE INDEX IF NOT EXISTS idx_kraken_book_snapshots_time ON kraken_book_snapshots (polled_at);
 """
 
 
@@ -591,3 +605,28 @@ def upsert_fill(conn: sqlite3.Connection, **row: Any) -> None:
 def fetch_fills(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     conn.row_factory = sqlite3.Row
     return conn.execute("SELECT * FROM fills ORDER BY bid_created_at ASC").fetchall()
+
+
+def insert_kraken_book_snapshot(
+    conn: sqlite3.Connection, book: "external_rates.KrakenBook", polled_at: float | None = None
+) -> None:
+    conn.execute(
+        "INSERT INTO kraken_book_snapshots (polled_at, best_bid, best_ask, buy_cost_1xmr_pct, "
+        "buy_cost_5xmr_pct) VALUES (?, ?, ?, ?, ?)",
+        (
+            polled_at if polled_at is not None else time.time(),
+            book.best_bid, book.best_ask, book.buy_cost_pct.get(1.0), book.buy_cost_pct.get(5.0),
+        ),
+    )
+    conn.commit()
+
+
+def nearest_kraken_book_snapshot(
+    conn: sqlite3.Connection, t: float, max_gap_seconds: float = 20 * 60
+) -> sqlite3.Row | None:
+    conn.row_factory = sqlite3.Row
+    return conn.execute(
+        "SELECT * FROM kraken_book_snapshots WHERE polled_at BETWEEN ? AND ? "
+        "ORDER BY ABS(polled_at - ?) LIMIT 1",
+        (t - max_gap_seconds, t + max_gap_seconds, t),
+    ).fetchone()

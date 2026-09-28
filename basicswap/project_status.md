@@ -1158,3 +1158,105 @@ First real run (22 bids on own offers, 5 completed): −15,821 sats summed @fill
 today: +0.00089421 BTC, −0.22940356 XMR = **−62,660 sats (−$52.63)**. The 09-25 06:58
 completed ask shows n/a because the observation poller has been dead since 09-23 09:34
 (see TASKS.md).
+
+## 2026-09-28: accumulate-BTC objective, steps 3–4 built (`--objective btc`), NOT deployed
+
+These are steps 3 and 4 of the 09-25 plan (a BTC-heavy inventory target, and a
+restock-priced ask side). Both change live quoting, so they're built and tested
+only. `restart_live_maker_btc.sh` is written but hasn't been run, and the default
+USD path is unchanged. 206/206 `strategy/tests` pass (23 new).
+
+**Data that drove the design** (14 days, every non-own offer vs. the
+Kraken/CoinGecko mid; "best" = the best quote on the book at each poll):
+- Taking someone else's XMR to restock costs a median **+1.85%** on BasicSwap
+  (+1.28% on Bisq/Eigen ASB). That's about the whole sell premium, so a
+  take-to-restock loop nets roughly zero minus fees. `topup_xmr.py` paid +2.19%
+  on 09-25.
+- The best BasicSwap maker *buying* XMR quotes a median **+0.33%** (p10 −0.66%).
+  Today's 2% ask was the best quote in **2%** of polls. The only way to restock
+  cheaply is as a maker at under about +0.4%.
+- On the sell side, being the cheapest BasicSwap XMR seller happens in 36% of
+  polls at +2.0%, 55% at +1.8% and 75% at +1.5%.
+
+**What `--objective btc` does** (see `strategy/live_maker.py`'s "Objective" note):
+- **Restock leg** (btc→xmr): priced by `economics.restock_half_spread_pct`.
+  It charges the round trip once (2 swap fees in sats + vol buffer + margin),
+  minus `--restock-expected-sell-premium-pct`, with a floor at
+  `--restock-min-half-spread-pct` (0.25%, always above mid). At today's inputs
+  and a 1.8% sell premium, that's **+0.39%** at 0.0075 BTC and **+0.56%** at
+  ~0.0039 BTC. Historically those would have been the best BasicSwap quote in
+  roughly 47% and 20–25% of polls. `--restock-target-coin-to` sizes offers so the wallet's
+  total XMR only tops up to the target. At target it revokes the live offer,
+  since extra XMR is only XMR/BTC risk. An oversized live offer gets resized
+  (stored as a `reprice` row, because the table's CHECK constraint predates
+  "resize").
+- **Sell leg** (xmr→btc): quotes `--half-spread-pct` as its target premium and
+  widens only when live vol exceeds the baseline (`sell_leg_half_spread_pct`).
+  The first version priced this leg with the full single-leg cost model (2.22%
+  at 0.5 XMR). Combined with the restock pricing, that counted vol and margin
+  twice, which the what-if run caught.
+- `--reserve-coin` holds back a fixed XMR amount instead of a USD value.
+
+**Proposed live config** (`restart_live_maker_btc.sh`): 0.385 XMR reserve (≈ the
+$210), 0.6 XMR working stock, sell at +1.8%, restock cap 0.0075 BTC, and
+`--amount-step 0.05` on the sell leg (no dust offer, and the balance isn't
+disclosed). Wallet 09-28: 0.00787844 BTC, 0.3885 XMR. **Side finding:** the
+existing `restart_live_maker.sh` ask uses `--amount-from 0.008`, which is more
+than the BTC balance, so its ask side would just log InsufficientBalance.
+
+**Caveats, stated plainly:**
+- There's still no proven edge. Loop P&L = sell premium + restock markup − fees
+  − XMR/BTC drift while holding stock.
+- The restock leg quotes the direction Bisq flow says almost nobody trades
+  (~96% of volume buys XMR), so its fill rate is the open question. Fills it
+  does get may skew toward adverse flow. The kill-switch + cooldown are the
+  guard there.
+- `assumed_fill_hours=2.5` is still a guess (#15 Phase C).
+
+**Fill ledger 09-28**: 31 bids on own offers (5 completed); net position vs.
+never trading **−57,930 sats (−$48.66)**. It was −62,660 on 09-25; the change
+is the mark only, with no new fills. Gap: the net-position score leaves out
+bids *we* sent (`topup_xmr.py`'s 09-25 buy, any `bid_scanner` fills), so it
+overstates the BTC score by about that buy's ~3.4k-sat premium plus its markout.
+
+**Also written, not installed**: `com.market_maker.basicswap-poller.plist` (300s)
+and `com.market_maker.fill-ledger.plist` (3600s) in this directory, cloned from
+the venues plist. Install commands are in each file's header. The session's kill
+of a duplicate hand-started poller (PID 33211, started 09-28 13:07, alongside
+22008 from 12:24) was denied, so two pollers were running at the time of writing.
+
+## 2026-09-28, later: proof-trial tooling + success bar (`next_steps.md` #17)
+
+Evan asked whether a $5k pot could make ~$4k/yr. It can't be shown: that figure
+stacked optimistic inputs. A defensible range is negative to ~$2k/yr, with
+~$100–300 as the base case. He then asked for the success bar and whatever the
+proof step needs. Built, 226/226 `strategy/tests` pass (20 new). Nothing live changed.
+
+- **`strategy/proof_report.py`**: scores the trial from `~/coinswaps/proof_trial_start`.
+  It reports sell/restock uptime and best-price share, sell fills per week, each
+  sell fill's Kraken-restock margin, net sats, and a PESSIMISTIC / BASE / OPTIMISTIC /
+  INCONCLUSIVE verdict against the #17 bar. First run over the last 14 days:
+  PROVISIONAL INCONCLUSIVE. The sell offer was live in 1% of cycles, and its 3
+  fills were the 09-18/09-25 below-mid bug fills (margins −1.2% to −4.5%). The
+  real trial window starts at restart, so those are excluded.
+- **Kraken depth** (`external_rates.get_kraken_xmr_book`, a new
+  `kraken_book_snapshots` table, one row per poller cycle): buying 1–5 XMR cost
+  +0.12–0.13% over mid on 09-28. **The running hand-started pollers use the old
+  code** and won't write these until restarted (or replaced by the launchd job).
+- **Sent bids** (`api_client.get_sent_bids`, `/json/sentbids`). Found that
+  `/json/bids` only returns bids on our own offers. Two consequences, both fixed:
+  1. `fill_ledger.sync_sent` now records our top-ups/`bid_scanner` fills as
+     side `taker`, with direction flipped. The all-time net including them is
+     −80,709 sats vs. −58,733 on own offers alone; the 09-17 swap that bought the
+     reserve accounts for most of the gap.
+  2. `live_maker._in_flight_swaps` claimed to cover sent bids but couldn't see
+     them, so a top-up in flight wouldn't have blocked the restock leg (a possible
+     double buy). It now checks both.
+- **`topup_xmr.py --target-xmr`** for seeding the sell leg's stock. The 09-28 dry
+  run found no BasicSwap XMR offer under +3% with room for 0.5965 XMR (cheapest
+  +2.99%, min 1 XMR; +3.04%, min 0.2). The seed would need `--max-premium-pct 0.035`
+  and cost ~11.7k sats. It also means a +1.8% sell offer would be the cheapest on
+  the book right now.
+- `restart_live_maker_btc.sh` writes the trial-start marker on first run and
+  documents the optional seed.
+- Small fix: `--amount-step` quantization was float-unsafe (0.6/0.05 floored to 11 steps).

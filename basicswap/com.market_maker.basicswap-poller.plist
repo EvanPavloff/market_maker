@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Added 2026-09-28 (market_maker/project_status.md handoff item 1). BasicSwap order-book + reference-rate poller (read-only). A hand-started
+  `run_poller.sh --loop` died silently 09-23 and ran twice on 09-28; this replaces it.
+  Stop any hand-started copy first (`pgrep -fl strategy.poller`).
+  Cloned from ../venues/com.market_maker.venues-poller.plist: calls the venv's
+  python3 directly (launchd-spawned bash can't read under ~/Desktop here), no
+  --loop (launchd's StartInterval is the loop). No .env exists in basicswap/,
+  so strategy/config.py's defaults apply, same as the run_*.sh wrappers.
+
+  Install:   cp com.market_maker.basicswap-poller.plist ~/Library/LaunchAgents/ && launchctl load ~/Library/LaunchAgents/com.market_maker.basicswap-poller.plist
+  Uninstall: launchctl unload ~/Library/LaunchAgents/com.market_maker.basicswap-poller.plist && rm ~/Library/LaunchAgents/com.market_maker.basicswap-poller.plist
+  Run now:   launchctl start com.market_maker.basicswap-poller
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.market_maker.basicswap-poller</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/evanpavloff/coinswaps/venv/bin/python3</string>
+        <string>-m</string>
+        <string>strategy.poller</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/evanpavloff/Desktop/Claude/market_maker/basicswap</string>
+    <key>StartInterval</key>
+    <integer>300</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/evanpavloff/coinswaps/basicswap_poller.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/evanpavloff/coinswaps/basicswap_poller.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/evanpavloff/coinswaps/venv/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>SWAP_DATADIR</key>
+        <string>/Users/evanpavloff/coinswaps</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>

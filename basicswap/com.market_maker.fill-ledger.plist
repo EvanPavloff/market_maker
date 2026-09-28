@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Added 2026-09-28 (market_maker/project_status.md handoff item 1). Hourly fill-ledger sync + report (read-only: /json/bids -> fills table).
+  Cloned from ../venues/com.market_maker.venues-poller.plist: calls the venv's
+  python3 directly (launchd-spawned bash can't read under ~/Desktop here), no
+  --loop (launchd's StartInterval is the loop). No .env exists in basicswap/,
+  so strategy/config.py's defaults apply, same as the run_*.sh wrappers.
+
+  Install:   cp com.market_maker.fill-ledger.plist ~/Library/LaunchAgents/ && launchctl load ~/Library/LaunchAgents/com.market_maker.fill-ledger.plist
+  Uninstall: launchctl unload ~/Library/LaunchAgents/com.market_maker.fill-ledger.plist && rm ~/Library/LaunchAgents/com.market_maker.fill-ledger.plist
+  Run now:   launchctl start com.market_maker.fill-ledger
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.market_maker.fill-ledger</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/evanpavloff/coinswaps/venv/bin/python3</string>
+        <string>-m</string>
+        <string>strategy.fill_ledger</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/evanpavloff/Desktop/Claude/market_maker/basicswap</string>
+    <key>StartInterval</key>
+    <integer>3600</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/evanpavloff/coinswaps/basicswap_fill_ledger.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/evanpavloff/coinswaps/basicswap_fill_ledger.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/evanpavloff/coinswaps/venv/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>SWAP_DATADIR</key>
+        <string>/Users/evanpavloff/coinswaps</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>

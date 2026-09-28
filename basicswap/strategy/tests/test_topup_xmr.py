@@ -53,6 +53,21 @@ class PlanTopupTests(unittest.TestCase):
         # (210/500 - 0.2) * 1.05 = 0.231
         self.assertAlmostEqual(plan["need_xmr"], 0.231)
 
+    def test_target_xmr_overrides_usd_target(self, *_):
+        self.client.get_offers.return_value = [_offer(0.0066 * 1.02)]
+        plan = self._plan(target_xmr=0.8, buffer_pct=0.0)
+        self.assertEqual(plan["action"], "bid")
+        self.assertAlmostEqual(plan["need_xmr"], 0.6)
+
+    def test_target_xmr_already_met(self, *_):
+        self.assertEqual(self._plan(target_xmr=0.1)["action"], "none")
+
+    def test_aborts_while_a_sent_bid_is_already_selling_xmr(self, *_):
+        self.client.get_sent_bids.return_value = [
+            {"bid_id": "y" * 56, "bid_state": "Script coin locked", "coin_from": "Bitcoin", "coin_to": "Monero"}
+        ]
+        self.assertEqual(self._plan()["action"], "abort")
+
     def test_aborts_when_btc_wallet_cannot_cover(self, *_):
         self.client.get_wallet_balance.side_effect = lambda c: {"xmr": 0.2, "btc": 0.0001}[c]
         self.client.get_offers.return_value = [_offer(0.0066 * 1.02)]

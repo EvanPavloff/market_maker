@@ -261,12 +261,23 @@ class BasicSwapClient:
         return rv["bid_id"]
 
     def get_bids(self) -> list[dict]:
-        """Read-only list of every bid BasicSwap knows about (sent and
-        received), each with bid_id/offer_id/bid_state/amounts/created_at.
-        Used by fill_ledger.py to tell fills from expiries."""
+        """Read-only list of bids RECEIVED on our own offers, each with
+        bid_id/offer_id/bid_state/amounts/created_at. Used by fill_ledger.py to
+        tell fills from expiries. Checked live 2026-09-28: bids this node SENT
+        (topup_xmr.py, bid_scanner.py) are not in here; see get_sent_bids()."""
         rv = self._get("/json/bids", {})
         if not isinstance(rv, list):
             raise BasicSwapAPIError(f"unexpected response from /json/bids: {rv!r}")
+        return rv
+
+    def get_sent_bids(self) -> list[dict]:
+        """Read-only list of bids this node SENT into other makers' offers
+        (/json/sentbids), same fields as get_bids(). coin_from/coin_to and the
+        amounts are the OFFER's direction, so for us it's the reverse: we give
+        amount_to of coin_to and receive amount_from of coin_from."""
+        rv = self._post("/json/sentbids", {})
+        if not isinstance(rv, list):
+            raise BasicSwapAPIError(f"unexpected response from /json/sentbids: {rv!r}")
         return rv
 
     def get_bid(self, bid_id: str) -> dict:

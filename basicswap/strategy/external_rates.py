@@ -239,3 +239,52 @@ def get_reference_rate(coin_from: str, coin_to: str, timeout: float = 10.0) -> R
         kraken_error=kraken_error,
         usd_price_from=usd_price_from,
     )
+
+
+@dataclass(frozen=True)
+class KrakenBook:
+    """Top of Kraken's public XMR/BTC book (BTC per XMR), plus what buying a
+    given XMR size at once would cost vs. mid. Added 2026-09-28 for the proof
+    step: the "restock on Kraken" leg is costed from real depth, not a guess.
+    Excludes Kraken's trading fee (not in the public API for this pair)."""
+
+    best_bid: float
+    best_ask: float
+    buy_cost_pct: dict[float, float | None]  # XMR size -> avg fill price / mid - 1
+
+    @property
+    def mid(self) -> float:
+        return (self.best_bid + self.best_ask) / 2
+
+
+def parse_kraken_book(data: object, sizes: tuple[float, ...]) -> KrakenBook:
+    if not isinstance(data, dict) or data.get("error"):
+        raise ExternalRateError(f"Kraken Depth error: {data.get('error') if isinstance(data, dict) else data!r}")
+    result = data.get("result") or {}
+    if not result:
+        raise ExternalRateError("Kraken Depth returned no result")
+    book = next(iter(result.values()))
+    asks = [(float(p), float(v)) for p, v, *_ in book["asks"]]
+    bids = [(float(p), float(v)) for p, v, *_ in book["bids"]]
+    if not asks or not bids:
+        raise ExternalRateError("Kraken Depth returned an empty side")
+    mid = (asks[0][0] + bids[0][0]) / 2
+    costs: dict[float, float | None] = {}
+    for size in sizes:
+        got = cost = 0.0
+        for price, vol in asks:
+            take = min(vol, size - got)
+            got += take
+            cost += take * price
+            if got >= size:
+                break
+        # None = not enough depth in the levels fetched to fill this size.
+        costs[size] = cost / got / mid - 1 if got >= size else None
+    return KrakenBook(best_bid=bids[0][0], best_ask=asks[0][0], buy_cost_pct=costs)
+
+
+def get_kraken_xmr_book(sizes: tuple[float, ...] = (1.0, 5.0), timeout: float = 10.0) -> KrakenBook:
+    url = "https://api.kraken.com/0/public/Depth?" + urllib.parse.urlencode(
+        {"pair": _KRAKEN_PAIRS[("xmr", "btc")], "count": 50}
+    )
+    return parse_kraken_book(_get_json(url, timeout), sizes)

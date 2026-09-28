@@ -47,6 +47,7 @@ def plan_topup(
     buffer_pct: float,
     max_source_disagreement_pct: float,
     now: float | None = None,
+    target_xmr: float | None = None,
 ) -> dict:
     """Decides what (if anything) to bid. Returns a dict with "action" in
     {"none", "abort", "bid"} and the numbers behind it. Makes no writes."""
@@ -68,10 +69,13 @@ def plan_topup(
     value_usd = xmr_balance * xmr_usd
     plan = {"xmr_balance": xmr_balance, "xmr_usd": xmr_usd, "value_usd": value_usd,
             "reference_mid_btc_per_xmr": mid}
-    if value_usd >= target_usd:
-        return {**plan, "action": "none", "reason": f"${value_usd:.2f} >= ${target_usd:.2f}"}
+    # target_xmr (2026-09-28): an exact XMR target instead of a USD one, used to
+    # seed the accumulate-BTC trial's sell-leg stock (reserve + working XMR).
+    target_coin = target_xmr if target_xmr is not None else target_usd / xmr_usd
+    if xmr_balance >= target_coin:
+        return {**plan, "action": "none", "reason": f"{xmr_balance:.8f} XMR >= target {target_coin:.8f}"}
 
-    need_xmr = (target_usd / xmr_usd - xmr_balance) * (1 + buffer_pct)
+    need_xmr = (target_coin - xmr_balance) * (1 + buffer_pct)
     ceiling = mid * (1 + max_premium_pct)
     cfg = BidScannerConfig(coin_from="xmr", coin_to="btc", half_spread_pct=0.0,
                            max_bid_amount=need_xmr, max_cycle_exposure=need_xmr)
@@ -94,9 +98,11 @@ def plan_topup(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="One-shot BTC->XMR top-up to a USD target.")
+    parser = argparse.ArgumentParser(description="One-shot BTC->XMR top-up to a USD (or --target-xmr) target.")
     parser.add_argument("--live", action="store_true", help="actually submit the bid")
     parser.add_argument("--target-usd", type=float, default=210.0)
+    parser.add_argument("--target-xmr", type=float, default=None,
+                        help="top up to this total XMR balance instead of --target-usd")
     parser.add_argument("--max-premium-pct", type=float, default=0.03,
                         help="max offer rate over reference mid (BTC per XMR) we'll pay")
     parser.add_argument("--buffer-pct", type=float, default=0.05,
@@ -110,7 +116,7 @@ def main(argv: list[str] | None = None) -> int:
                              auth_password=config.auth_password, timeout_seconds=60)
     try:
         plan = plan_topup(client, args.target_usd, args.max_premium_pct, args.buffer_pct,
-                          args.max_source_disagreement_pct)
+                          args.max_source_disagreement_pct, target_xmr=args.target_xmr)
     except (BasicSwapAPIError, ExternalRateError) as e:
         log.error("ABORT: %s", e)
         return 2

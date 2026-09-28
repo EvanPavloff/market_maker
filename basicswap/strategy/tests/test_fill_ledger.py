@@ -106,5 +106,30 @@ class FillLedgerTests(unittest.TestCase):
         self.assertIn("net: n/a", out)
 
 
+class SentBidTests(unittest.TestCase):
+    def test_sent_bid_is_stored_reversed_as_taker(self):
+        conn = storage.connect(":memory:")
+        conn.execute(
+            "INSERT INTO direct_rate_snapshots (polled_at, coin_from, coin_to, coingecko_rate, kraken_rate) "
+            "VALUES (?, 'Monero', 'Bitcoin', 0.0066, NULL)", (T0,),
+        )
+        conn.commit()
+        # Real 09-25 top-up: an offer selling XMR for BTC; we paid BTC, got XMR.
+        n = fill_ledger.sync_sent(conn, [{
+            "bid_id": "t", "offer_id": "theirs", "bid_state": "Completed", "created_at": T0,
+            "coin_from": "Monero", "coin_to": "Bitcoin", "amount_from": "0.2327", "amount_to": "0.00157321",
+            "bid_rate": "0.00676063",
+        }], now=T0)
+        self.assertEqual(n, 1)
+        row = storage.fetch_fills(conn)[0]
+        self.assertEqual((row["side"], row["coin_from"], row["coin_to"]), ("taker", "Bitcoin", "Monero"))
+        self.assertAlmostEqual(row["amount_from"], 0.00157321)
+        # Paid above mid, so a negative edge.
+        self.assertAlmostEqual(row["edge_pct_at_fill"], 0.2327 / (0.00157321 / 0.0066) - 1)
+        self.assertLess(row["edge_pct_at_fill"], 0)
+        own_only = fill_ledger.net_flows([row], include_taker=False)
+        self.assertEqual(own_only, {})
+
+
 if __name__ == "__main__":
     unittest.main()

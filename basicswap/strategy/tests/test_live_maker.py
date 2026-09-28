@@ -11,9 +11,11 @@ from ..live_maker import (
     LiveMakerConfig,
     _dynamic_half_spread_pct,
     _resolve_amount_from,
+    SATS_PER_BTC,
     decide_and_act,
     run_cycle,
 )
+from ..economics import restock_half_spread_pct
 from ..volatility import VolatilityMonitor
 
 
@@ -674,6 +676,175 @@ class RunCycleDynamicSpreadTests(unittest.TestCase):
         self.client.post_offer.assert_called_once()
         args, _ = self.client.post_offer.call_args
         self.assertAlmostEqual(float(args[3]), 150.0 * 1.02)
+
+
+class BtcObjectiveConfigTests(unittest.TestCase):
+    def test_restock_target_rejected_on_sell_leg(self):
+        with self.assertRaises(ValueError):
+            _cfg(coin_from="xmr", coin_to="btc", side="bid", objective="btc", restock_target_to=0.5)
+
+    def test_restock_target_rejected_under_usd_objective(self):
+        with self.assertRaises(ValueError):
+            _cfg(restock_target_to=0.5)
+
+    def test_restock_target_needs_fixed_cap(self):
+        with self.assertRaises(ValueError):
+            _cfg(amount_from=None, reserve_coin=0.001, objective="btc", restock_target_to=0.5)
+
+    def test_btc_objective_needs_btc_in_pair(self):
+        with self.assertRaises(ValueError):
+            _cfg(coin_from="ltc", coin_to="xmr", objective="btc")
+
+    def test_two_sizings_rejected(self):
+        with self.assertRaises(ValueError):
+            _cfg(reserve_coin=0.1)
+
+    def test_restock_floor_must_stay_above_mid(self):
+        with self.assertRaises(ValueError):
+            _cfg(objective="btc", restock_min_half_spread_pct=0.0)
+
+
+class ReserveCoinTests(unittest.TestCase):
+    @patch("strategy.live_maker.external_rates.get_usd_price")
+    def test_reserve_coin_needs_no_usd_price(self, mock_usd_price):
+        client = MagicMock()
+        client.get_wallet_balance.return_value = 0.5
+        cfg = _cfg(coin_from="xmr", coin_to="btc", side="bid", amount_from=None, reserve_coin=0.3)
+        self.assertAlmostEqual(_resolve_amount_from(client, cfg), 0.2)
+        mock_usd_price.assert_not_called()
+
+    def test_reserve_coin_above_balance_returns_none(self):
+        client = MagicMock()
+        client.get_wallet_balance.return_value = 0.2
+        cfg = _cfg(coin_from="xmr", coin_to="btc", side="bid", amount_from=None, reserve_coin=0.3)
+        self.assertIsNone(_resolve_amount_from(client, cfg))
+
+
+class RunCycleBtcObjectiveTests(unittest.TestCase):
+    """--objective btc end-to-end through run_cycle (mid = 150 XMR per BTC)."""
+
+    def setUp(self):
+        self.conn = storage.connect(":memory:")
+        self.client = MagicMock()
+        self.balances = {"btc": 1.0, "xmr": 0.0}
+        self.client.get_wallet_balance.side_effect = lambda coin: self.balances[coin]
+        self.client.get_bids.return_value = []
+        self.client.get_sent_offers.return_value = []
+        self.client.post_offer.return_value = "aaaa"
+        self.monitor = VolatilityMonitor(window_seconds=900)
+
+    def _restock_cfg(self, **overrides):
+        base = dict(half_spread_pct=0.02, objective="btc", assumed_fill_hours=2.5,
+                    restock_expected_sell_premium_pct=0.018)
+        base.update(overrides)
+        return _cfg(**base)
+
+    @patch("strategy.live_maker.external_rates.get_reference_rate")
+    def test_restock_leg_quotes_below_the_usd_floor(self, mock_rate):
+        mock_rate.return_value = _rate(usd_price_from=110_000.0)
+        run_cycle(self.client, self.conn, self._restock_cfg(), self.monitor)
+
+        args, _ = self.client.post_offer.call_args
+        expected_h = restock_half_spread_pct(0.0025, 0.008 * SATS_PER_BTC, 2.5, 0.018, None, 900)
+        self.assertLess(expected_h, 0.02)
+        self.assertAlmostEqual(float(args[3]), 150.0 * (1 + expected_h), places=6)
+        self.assertGreater(float(args[3]), 150.0)
+
+    @patch("strategy.live_maker.external_rates.get_reference_rate")
+    def test_restock_target_reached_posts_nothing_and_revokes(self, mock_rate):
+        mock_rate.return_value = _rate()
+        self.balances["xmr"] = 1.5
+        self.client.get_sent_offers.return_value = [
+            {"offer_id": "live", "rate": "150.5", "created_at": time.time(),
+             "is_expired": False, "is_revoked": False}
+        ]
+        run_cycle(self.client, self.conn, self._restock_cfg(restock_target_to=1.2), self.monitor)
+
+        self.client.post_offer.assert_not_called()
+        self.client.revoke_offer.assert_called_once_with("live", refuse_if_negotiating=True)
+
+    @patch("strategy.live_maker.external_rates.get_reference_rate")
+    def test_restock_sizes_to_the_deficit(self, mock_rate):
+        mock_rate.return_value = _rate()
+        self.balances["xmr"] = 0.6  # target 1.0 -> needs 0.4 XMR, ~0.00266 BTC < 0.008 cap
+        run_cycle(self.client, self.conn, self._restock_cfg(restock_target_to=1.0), self.monitor)
+
+        args, _ = self.client.post_offer.call_args
+        amount, rate = float(args[2]), float(args[3])
+        self.assertLess(amount, 0.008)
+        self.assertAlmostEqual(amount * rate, 0.4, places=4)
+
+    @patch("strategy.live_maker.external_rates.get_reference_rate")
+    def test_restock_deficit_below_min_amount_stands_down(self, mock_rate):
+        mock_rate.return_value = _rate()
+        self.balances["xmr"] = 0.95  # 0.05 XMR ~ 0.00033 BTC < 0.001 min
+        run_cycle(self.client, self.conn, self._restock_cfg(restock_target_to=1.0), self.monitor)
+        self.client.post_offer.assert_not_called()
+
+    @patch("strategy.live_maker.external_rates.get_reference_rate")
+    def test_oversized_live_restock_offer_is_resized(self, mock_rate):
+        mock_rate.return_value = _rate()
+        self.balances["xmr"] = 0.6
+        cfg = self._restock_cfg(restock_target_to=1.0)
+        h = restock_half_spread_pct(0.0025, 0.0026 * SATS_PER_BTC, 2.5, 0.018, None, 900)
+        self.client.get_sent_offers.return_value = [
+            {"offer_id": "live", "rate": f"{150.0 * (1 + h):.8f}", "amount_from": "0.008",
+             "created_at": time.time(), "is_expired": False, "is_revoked": False}
+        ]
+        self.client.post_offer.return_value = "bbbb"
+        run_cycle(self.client, self.conn, cfg, self.monitor)
+
+        self.client.revoke_offer.assert_called_once_with("live", refuse_if_negotiating=True)
+        self.assertLess(float(self.client.post_offer.call_args[0][2]), 0.008)
+        events = storage.fetch_live_quote_events(self.conn, "Bitcoin", "Monero", side="ask")
+        self.assertEqual(events[0]["action"], "reprice")
+
+    @patch("strategy.live_maker.external_rates.get_reference_rate")
+    def test_usd_objective_never_resizes_on_amount_alone(self, mock_rate):
+        mock_rate.return_value = _rate(usd_price_from=None)
+        self.client.get_sent_offers.return_value = [
+            {"offer_id": "live", "rate": f"{150.0 * 1.02:.8f}", "amount_from": "0.05",
+             "created_at": time.time(), "is_expired": False, "is_revoked": False}
+        ]
+        run_cycle(self.client, self.conn, _cfg(half_spread_pct=0.02), self.monitor)
+        self.client.revoke_offer.assert_not_called()
+        self.client.post_offer.assert_not_called()
+
+    @patch("strategy.live_maker.external_rates.get_reference_rate")
+    def test_sell_leg_prices_in_sats_without_a_usd_price(self, mock_rate):
+        # xmr->btc: mid is BTC per XMR. usd_price_from=None would pin the USD
+        # path to its floor; the sats path still widens on elevated volatility.
+        self.balances["xmr"] = 1.0
+        self.monitor.add(time.time() - 60, 0.006605)
+        mock_rate.return_value = _rate(coin_from="xmr", coin_to="btc", coingecko_rate=0.00666, usd_price_from=None)
+        cfg = _cfg(coin_from="xmr", coin_to="btc", side="bid", amount_from=0.5,
+                   half_spread_pct=0.02, objective="btc", assumed_fill_hours=2.5)
+        run_cycle(self.client, self.conn, cfg, self.monitor)
+
+        args, _ = self.client.post_offer.call_args
+        self.assertGreater(float(args[3]), 0.00666 * 1.02)
+
+
+class InFlightSentBidTests(unittest.TestCase):
+    def test_sent_topup_blocks_the_restock_leg(self):
+        from ..live_maker import _in_flight_swaps
+
+        client = MagicMock()
+        client.get_bids.return_value = []
+        # A top-up we sent into someone's XMR-selling offer spends BTC for XMR,
+        # the same thing the btc->xmr restock leg does.
+        client.get_sent_bids.return_value = [
+            {"bid_id": "t", "bid_state": "Script coin locked", "coin_from": "Monero", "coin_to": "Bitcoin"},
+            {"bid_id": "done", "bid_state": "Completed", "coin_from": "Monero", "coin_to": "Bitcoin"},
+        ]
+        self.assertEqual([b["bid_id"] for b in _in_flight_swaps(client, "btc", "xmr")], ["t"])
+        self.assertEqual(_in_flight_swaps(client, "xmr", "btc"), [])
+
+    def test_amount_step_quantization_is_float_safe(self):
+        client = MagicMock()
+        client.get_wallet_balance.return_value = 0.985
+        cfg = _cfg(coin_from="xmr", coin_to="btc", side="bid", amount_from=None, reserve_coin=0.385, amount_step=0.05)
+        self.assertAlmostEqual(_resolve_amount_from(client, cfg), 0.6)
 
 
 if __name__ == "__main__":

@@ -180,13 +180,74 @@ def dynamic_half_spread_pct(
     if notional_usd <= 0:
         raise ValueError(f"notional_usd must be positive, got {notional_usd}")
     fee_usd = assumptions.fee_round_trip_usd_today
+    vol_buffer = _live_vol_buffer_pct(lock_hours, live_vol_pct, live_vol_window_seconds, sigma)
+    required = required_spread_pct(notional_usd, fee_usd, vol_buffer, assumptions.min_profit_margin_pct)
+    return max(operator_floor_pct, required)
+
+
+def _live_vol_buffer_pct(
+    hours: float, live_vol_pct: float | None, live_vol_window_seconds: float | None, sigma: float
+) -> float:
     if live_vol_pct is not None and live_vol_window_seconds:
         annualized_vol_pct = live_annualized_vol_pct(live_vol_pct, live_vol_window_seconds)
     else:
         annualized_vol_pct = ANNUALIZED_CROSS_VOL_PCT
-    vol_buffer = vol_buffer_pct_for_hours(lock_hours, sigma, annualized_vol_pct)
-    required = required_spread_pct(notional_usd, fee_usd, vol_buffer, assumptions.min_profit_margin_pct)
-    return max(operator_floor_pct, required)
+    return vol_buffer_pct_for_hours(hours, sigma, annualized_vol_pct)
+
+
+def sell_leg_half_spread_pct(
+    target_premium_pct: float,
+    hold_hours: float,
+    live_vol_pct: float | None,
+    live_vol_window_seconds: float | None,
+    sigma: float = 1.0,
+) -> float:
+    """Accumulate-BTC objective, sell leg (XMR -> BTC), 2026-09-28. The round
+    trip's fees, baseline vol buffer and margin are charged once, in
+    restock_half_spread_pct, so this leg quotes its target premium (set to
+    compete on the XMR-sell book) and widens only by how far live volatility's
+    buffer exceeds the baseline ANNUALIZED_CROSS_VOL_PCT one. That keeps Phase A's
+    widen-in-a-spike behavior without counting the baseline buffer twice."""
+    live = _live_vol_buffer_pct(hold_hours, live_vol_pct, live_vol_window_seconds, sigma)
+    baseline = vol_buffer_pct_for_hours(hold_hours, sigma)
+    return target_premium_pct + max(0.0, live - baseline)
+
+
+def restock_half_spread_pct(
+    min_half_spread_pct: float,
+    notional_sats: float,
+    hold_hours: float,
+    expected_sell_premium_pct: float,
+    live_vol_pct: float | None,
+    live_vol_window_seconds: float | None,
+    assumptions: CostAssumptions = DEFAULT_ASSUMPTIONS,
+    sigma: float = 1.0,
+) -> float:
+    """Accumulate-BTC objective, restock leg (BTC -> XMR). The loop is BTC -> XMR
+    (this leg) -> BTC (the sell leg, at a premium), scored in sats, so this leg
+    only has to cover what the sell leg's expected premium doesn't (this is the
+    one place the round trip's fees, vol buffer and margin are charged):
+
+        restock + sell_premium >= 2 swap fees + vol buffer over hold_hours + margin
+
+    Returns max(min_half_spread_pct, that requirement - expected_sell_premium_pct).
+    With expected_sell_premium_pct=0 the restock leg must clear the whole round
+    trip alone (the conservative default). min_half_spread_pct should stay > 0:
+    live_maker refuses any offer at or below mid. Data behind the use case
+    (basicswap/project_status.md 2026-09-28): the best BasicSwap maker buying XMR
+    quoted a median +0.33% over 14 days, so a restock quote at today's 2% floor
+    is priced out, while TAKING someone's XMR offer cost a median +1.85%, which
+    eats the whole sell premium."""
+    if notional_sats <= 0:
+        raise ValueError(f"notional_sats must be positive, got {notional_sats}")
+    vol_buffer = _live_vol_buffer_pct(hold_hours, live_vol_pct, live_vol_window_seconds, sigma)
+    round_trip_required = required_spread_pct(
+        notional_sats,
+        2 * assumptions.fee_round_trip_sats_today,
+        vol_buffer,
+        assumptions.min_profit_margin_pct,
+    )
+    return max(min_half_spread_pct, round_trip_required - expected_sell_premium_pct)
 
 
 @dataclass

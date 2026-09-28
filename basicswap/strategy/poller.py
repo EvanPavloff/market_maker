@@ -70,6 +70,14 @@ def poll_once(client: BasicSwapClient, conn, config: Config) -> None:
             direct = dataclasses.replace(direct, coin_from=display_from, coin_to=display_to)
             storage.insert_direct_rate_snapshot(conn, direct, polled_at=polled_at)
 
+    # Proof step (2026-09-28): Kraken XMR/BTC depth, so proof_report.py can cost
+    # "restock on Kraken" at each sell fill's time. Best-effort, like the above.
+    if any({a, b} == {"xmr", "btc"} for a, b in config.pairs):
+        try:
+            storage.insert_kraken_book_snapshot(conn, external_rates.get_kraken_xmr_book(), polled_at=polled_at)
+        except (ExternalRateError, OSError, KeyError, ValueError) as e:
+            log.warning("get_kraken_xmr_book failed: %s", e)
+
 
 def run(loop: bool) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")

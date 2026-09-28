@@ -1001,3 +1001,35 @@ are still stopped.
    of fees over ≥30 fills) so "is it profitable" has a yes/no answer.
 7. Unblocked but lower priority: #5 tax lots (built on the `fills` table).
    XMR funding and bid-side reserve are deferred by Evan, so don't re-flag them.
+
+## 2026-09-28: BTC-objective retarget built (steps 3–4 of the 09-25 plan), not deployed
+
+`--objective btc` in `basicswap/strategy/live_maker.py` prices the ask side as
+a **restock leg** (buy XMR back at +0.39–0.56% instead of +2%, charging the
+round trip once) and the bid side as the **sell leg** at a target premium (+1.8%
+proposed). A target XMR balance caps how much XMR the desk holds.
+206/206 tests. Details, the 14-day book data and caveats are in
+`basicswap/project_status.md`'s 2026-09-28 entry. Net position vs. never
+trading: −57,930 sats.
+
+## Handoff for the next session (2026-09-28, supersedes the 2026-09-24 handoff)
+
+0. **Proof trial (`next_steps.md` #17) is built.** To start it: optionally seed
+   0.6 XMR (`python3 -m strategy.topup_xmr --target-xmr 0.985 --buffer-pct 0
+   --max-premium-pct 0.035`, dry run first, then `--live`), then run
+   `restart_live_maker_btc.sh`. Score it with `python3 -m strategy.proof_report`
+   after `./run_fill_ledger.sh`. Minimum 4 weeks.
+1. **Decide whether to restart under `--objective btc`** (Evan's call).
+   `basicswap/restart_live_maker_btc.sh` is ready. Both loops are still
+   stopped and the 3 stuck swaps are abandoned, so the 09-25 blocker is gone.
+   The USD script's ask side is underfunded (0.008 > 0.00787844 BTC).
+2. **Install the two launchd jobs** (`basicswap/com.market_maker.basicswap-poller.plist`,
+   `basicswap/com.market_maker.fill-ledger.plist`). First stop the hand-started
+   pollers: two were running on 09-28 (PIDs 22008 and 33211), and this session's
+   kill was denied.
+3. **Success bar** (still open, item 6 of the 09-24 handoff). Suggested: net
+   position vs. never trading, in sats, positive over ≥30 completed round trips.
+4. **Fill-ledger gap**: include bids we *sent* (`topup_xmr.py`, `bid_scanner`) in
+   the net-position score.
+5. Unchanged: kill-switch 15-min threshold loosening (0.85%→1.2%) is Evan's
+   call; #5 tax lots is unblocked but low priority.

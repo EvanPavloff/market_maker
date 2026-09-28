@@ -122,6 +122,23 @@ Safety notes:
     on-by-default, matching this module's standing posture that a live-money
     behavior change needs Evan to actually pass the flag on the next
     restart, not just have it built.
+  - Objective (2026-09-28, --objective btc; basicswap/project_status.md's
+    matching entry). The default "usd" is every behavior above, unchanged.
+    "btc" scores the desk in sats: idle BTC is the benchmark and XMR is working
+    stock. The loop is BTC -> XMR (restock leg: an offer selling btc) -> BTC
+    (sell leg: an offer selling XMR at a premium). The round trip's fees, vol
+    buffer and margin are charged once, on the restock leg
+    (economics.restock_half_spread_pct): only what the sell leg's expected
+    premium doesn't already cover, floored at
+    --restock-min-half-spread-pct (always > 0, never at or below mid). With
+    --restock-target-coin-to it also buys only up to a total coin_to balance
+    and withdraws its offer at target, since XMR held beyond that is only
+    XMR/BTC risk. The sell leg quotes --half-spread-pct as its target premium
+    and widens only when live vol exceeds the baseline assumption
+    (economics.sell_leg_half_spread_pct); pricing each leg with the full
+    single-leg cost model would count vol buffer and margin twice. Set
+    --restock-expected-sell-premium-pct to the sell leg's --half-spread-pct.
+    Opt-in; a restart without these flags changes nothing.
 """
 
 import argparse
@@ -172,12 +189,36 @@ class LiveMakerConfig:
     # above (the offer's technical HTLC ceiling). Stays a guess until #15 Phase C
     # measures real fill times.
     assumed_fill_hours: float = 2.5
+    # Accumulate-BTC objective (2026-09-28, see the module docstring's
+    # "Objective" note). "usd" keeps every pre-09-28 behavior unchanged.
+    objective: str = "usd"
+    reserve_coin: float | None = None  # like reserve_usd, but in coin_from units
+    restock_target_to: float | None = None  # btc objective, restock leg: total coin_to wallet target
+    restock_expected_sell_premium_pct: float = 0.0
+    restock_min_half_spread_pct: float = 0.0025
+    restock_min_amount_from: float = 0.001
 
     def __post_init__(self):
-        has_fixed = self.amount_from is not None
-        has_reserve = self.reserve_usd is not None
-        if has_fixed == has_reserve:
-            raise ValueError("exactly one of amount_from or reserve_usd must be set")
+        sizings = [self.amount_from, self.reserve_usd, self.reserve_coin]
+        if sum(s is not None for s in sizings) != 1:
+            raise ValueError("exactly one of amount_from, reserve_usd or reserve_coin must be set")
+        if self.objective not in ("usd", "btc"):
+            raise ValueError(f"objective must be 'usd' or 'btc', got {self.objective!r}")
+        if self.objective == "btc" and "btc" not in (self.coin_from, self.coin_to):
+            raise ValueError("objective='btc' needs btc on one side of the pair")
+        if self.restock_target_to is not None:
+            if not self.is_restock_leg:
+                raise ValueError("restock_target_to only applies to objective='btc' offers that sell btc")
+            if self.amount_from is None:
+                raise ValueError("restock_target_to needs amount_from as the per-offer size cap")
+        if self.is_restock_leg and not self.restock_min_half_spread_pct > 0:
+            raise ValueError("restock_min_half_spread_pct must be > 0 (offers never go at or below mid)")
+
+    @property
+    def is_restock_leg(self) -> bool:
+        """BTC objective, selling BTC to buy the other coin: this leg only
+        restocks inventory the sell leg earns sats on."""
+        return self.objective == "btc" and self.coin_from == "btc"
 
 
 # Mirrors bid_scanner._TERMINAL_*: any other bid_state is a swap still in
@@ -198,16 +239,18 @@ def _offer_rate(reference_mid: float, half_spread_pct: float) -> float:
 
 
 def _in_flight_swaps(client: BasicSwapClient, coin_from: str, coin_to: str) -> list[dict]:
-    """Non-terminal bids that sell coin_from for coin_to, i.e. swaps on our own
-    offers in this direction that could still take funds from the wallet. Also
-    matches a bid we SENT into someone else's offer in the same direction
-    (bid_scanner); that over-blocks, which is the safe way to be wrong."""
+    """Non-terminal swaps that spend coin_from for coin_to: bids on our own
+    offers in this direction, plus bids we SENT into someone else's offer that
+    spend the same coin (topup_xmr/bid_scanner). A sent bid carries the offer's
+    direction, so it matches reversed. The docstring always claimed sent bids
+    were covered, but /json/bids never returns them (found 2026-09-28), so a
+    top-up in flight could run in parallel with a restock offer until
+    get_sent_bids() was added here."""
     cf, ct = coin_names.to_display_name(coin_from), coin_names.to_display_name(coin_to)
-    return [
-        b for b in client.get_bids()
-        if b.get("coin_from") == cf and b.get("coin_to") == ct
-        and b.get("bid_state") not in _TERMINAL_BID_STATES
-    ]
+    live = lambda b: b.get("bid_state") not in _TERMINAL_BID_STATES  # noqa: E731
+    received = [b for b in client.get_bids() if b.get("coin_from") == cf and b.get("coin_to") == ct and live(b)]
+    sent = [b for b in client.get_sent_bids() if b.get("coin_from") == ct and b.get("coin_to") == cf and live(b)]
+    return received + sent
 
 
 class InsufficientBalanceError(RuntimeError):
@@ -319,8 +362,20 @@ def decide_and_act(
     drift_pct = abs(target_rate - live_rate) / live_rate
     age_seconds = now - live_created_at
 
+    # Restock leg only: a live offer bigger than this cycle's target-limited size
+    # would overshoot cfg.restock_target_to, so shrink it. Every other path keeps
+    # its pre-09-28 behavior (a size change alone never reposts).
+    live_amount = real_live_offer.get("amount_from")
+    oversized = (
+        cfg.is_restock_leg
+        and live_amount is not None
+        and float(live_amount) > cfg.amount_from * (1 + cfg.reprice_threshold_pct)
+    )
+
     if drift_pct > cfg.reprice_threshold_pct:
         action = "reprice"
+    elif oversized:
+        action = "resize"
     elif age_seconds > cfg.offer_valid_hours * 3600:
         action = "expire_repost"
     else:
@@ -329,8 +384,11 @@ def decide_and_act(
     _check_funded()
     client.revoke_offer(live_offer_id, refuse_if_negotiating=True)
     new_offer_id = _post_new_quote()
+    # live_quote_events' CHECK constraint predates "resize", and the production
+    # table can't be altered in place, so a resize is stored as a reprice row.
     storage.insert_live_quote_event(
-        conn, coin_from, coin_to, cfg.side, action, new_offer_id, cfg.amount_from,
+        conn, coin_from, coin_to, cfg.side, "reprice" if action == "resize" else action,
+        new_offer_id, cfg.amount_from,
         target_rate, reference_mid,
         previous_offer_id=live_offer_id, previous_rate=live_rate,
         previous_posted_at=live_created_at, drift_pct=drift_pct, created_at=now,
@@ -355,11 +413,13 @@ def _resolve_amount_from(client: BasicSwapClient, cfg: LiveMakerConfig) -> float
     if cfg.amount_from is not None:
         return cfg.amount_from
 
-    try:
-        usd_price = external_rates.get_usd_price(cfg.coin_from)
-    except ExternalRateError as e:
-        log.warning("get_usd_price(%s) failed, skipping this cycle: %s", cfg.coin_from, e)
-        return None
+    usd_price = None
+    if cfg.reserve_usd is not None:
+        try:
+            usd_price = external_rates.get_usd_price(cfg.coin_from)
+        except ExternalRateError as e:
+            log.warning("get_usd_price(%s) failed, skipping this cycle: %s", cfg.coin_from, e)
+            return None
     try:
         available = client.get_wallet_balance(cfg.coin_from)
     except BasicSwapAPIError as e:
@@ -370,18 +430,23 @@ def _resolve_amount_from(client: BasicSwapClient, cfg: LiveMakerConfig) -> float
         # function already does.
         log.warning("get_wallet_balance(%s) failed, skipping this cycle: %s", cfg.coin_from, e)
         return None
-    reserve_coin = cfg.reserve_usd / usd_price
+    # reserve_coin (2026-09-28, accumulate-BTC objective) holds back a fixed coin
+    # amount instead, so the reserve doesn't drift with the coin's USD price.
+    reserve_coin = cfg.reserve_coin if cfg.reserve_coin is not None else cfg.reserve_usd / usd_price
     dynamic_amount = available - reserve_coin
     if dynamic_amount <= 0:
+        reserve_desc = (
+            f"~${cfg.reserve_usd:.2f} at ${usd_price:.2f}/coin" if usd_price is not None else "fixed coin reserve"
+        )
         log.info(
-            "%s: balance %.8f, reserve %.8f (~$%.2f at $%.2f/coin) — nothing free to offer "
+            "%s: balance %.8f, reserve %.8f (%s) — nothing free to offer "
             "this cycle, any existing live offer is left untouched.",
-            cfg.coin_from, available, reserve_coin, cfg.reserve_usd, usd_price,
+            cfg.coin_from, available, reserve_coin, reserve_desc,
         )
         return None
 
     if cfg.amount_step is not None and cfg.amount_step > 0:
-        steps = int(dynamic_amount / cfg.amount_step)
+        steps = int(dynamic_amount / cfg.amount_step + 1e-9)  # 0.6/0.05 is 11.999... in floats
         quantized_amount = cfg.amount_step * steps
         if quantized_amount <= 0:
             log.info(
@@ -414,6 +479,86 @@ def _dynamic_half_spread_pct(
         live_vol_pct=vol_pct,
         live_vol_window_seconds=cfg.kill_switch_window_minutes * 60,
     )
+
+
+SATS_PER_BTC = 100_000_000
+
+
+def _notional_sats(cfg: LiveMakerConfig, amount_from: float, reference_mid: float) -> float:
+    """reference_mid is coin_to per coin_from, so a non-BTC coin_from converts via it."""
+    if cfg.coin_from == "btc":
+        return amount_from * SATS_PER_BTC
+    return amount_from * reference_mid * SATS_PER_BTC
+
+
+def _stand_down_restock(client: BasicSwapClient, cfg: LiveMakerConfig, held_to: float) -> None:
+    """Restock target reached: holding more of coin_to is pure XMR/BTC risk under
+    the BTC objective, so withdraw the live restock offer rather than leave it."""
+    try:
+        live = _find_own_live_offer(client, cfg.coin_from, cfg.coin_to)
+        if live is not None:
+            client.revoke_offer(live["offer_id"], refuse_if_negotiating=True)
+            log.info("%s/%s %s: revoked restock offer %s", cfg.coin_from, cfg.coin_to, cfg.side, live["offer_id"])
+    except (BasicSwapAPIError, AmbiguousLiveOffersError) as e:
+        log.warning("%s/%s %s: couldn't revoke restock offer at target: %s", cfg.coin_from, cfg.coin_to, cfg.side, e)
+    log.info(
+        "%s/%s %s: holding %.8f %s against a restock target of %.8f — not buying more this cycle.",
+        cfg.coin_from, cfg.coin_to, cfg.side, held_to, cfg.coin_to.upper(), cfg.restock_target_to,
+    )
+
+
+def _btc_objective_plan(
+    client: BasicSwapClient,
+    cfg: LiveMakerConfig,
+    amount_from: float,
+    reference_mid: float,
+    vol_pct: float | None,
+) -> tuple[float, float] | None:
+    """(amount_from, half_spread_pct) for this cycle under objective='btc', or None
+    to post nothing. Sell leg: cfg.half_spread_pct as its target premium, widened
+    only by excess live vol (economics.sell_leg_half_spread_pct). Restock leg: priced by
+    economics.restock_half_spread_pct (floored at cfg.restock_min_half_spread_pct,
+    NOT cfg.half_spread_pct), and sized so the wallet's coin_to balance only
+    tops up to cfg.restock_target_to when that's set."""
+    window_seconds = cfg.kill_switch_window_minutes * 60
+    if not cfg.is_restock_leg:
+        return amount_from, economics.sell_leg_half_spread_pct(
+            target_premium_pct=cfg.half_spread_pct,
+            hold_hours=cfg.assumed_fill_hours,
+            live_vol_pct=vol_pct,
+            live_vol_window_seconds=window_seconds,
+        )
+
+    def restock_h(amount: float) -> float:
+        return economics.restock_half_spread_pct(
+            min_half_spread_pct=cfg.restock_min_half_spread_pct,
+            notional_sats=amount * SATS_PER_BTC,
+            hold_hours=cfg.assumed_fill_hours,
+            expected_sell_premium_pct=cfg.restock_expected_sell_premium_pct,
+            live_vol_pct=vol_pct,
+            live_vol_window_seconds=window_seconds,
+        )
+
+    if cfg.restock_target_to is None:
+        return amount_from, restock_h(amount_from)
+
+    try:
+        held_to = client.get_wallet_balance(cfg.coin_to)
+    except BasicSwapAPIError as e:
+        log.warning("get_wallet_balance(%s) failed, skipping this cycle: %s", cfg.coin_to, e)
+        return None
+    deficit_to = cfg.restock_target_to - held_to
+    amount, h = amount_from, restock_h(amount_from)
+    if deficit_to > 0:
+        # The spread depends on size (fee share) and size on the spread (coin_to
+        # received per BTC); two passes settle it well inside a satoshi.
+        for _ in range(2):
+            amount = min(amount_from, deficit_to / (reference_mid * (1 + h)))
+            h = restock_h(amount)
+    if deficit_to <= 0 or amount < cfg.restock_min_amount_from:
+        _stand_down_restock(client, cfg, held_to)
+        return None
+    return amount, h
 
 
 def _pause_for_in_flight_swaps(client: BasicSwapClient, cfg: LiveMakerConfig, in_flight: list[dict]) -> None:
@@ -509,8 +654,19 @@ def run_cycle(
     if amount_from is None:
         return
 
-    half_spread_pct = _dynamic_half_spread_pct(cfg, amount_from, rate.usd_price_from, vol_pct)
-    if half_spread_pct != cfg.half_spread_pct:
+    if cfg.objective == "btc":
+        plan = _btc_objective_plan(client, cfg, amount_from, reference_mid, vol_pct)
+        if plan is None:
+            return
+        amount_from, half_spread_pct = plan
+        log.info(
+            "%s/%s %s: objective=btc %s half_spread_pct=%.4f amount=%.8f (%.0f sats notional)",
+            cfg.coin_from, cfg.coin_to, cfg.side, "restock" if cfg.is_restock_leg else "sell",
+            half_spread_pct, amount_from, _notional_sats(cfg, amount_from, reference_mid),
+        )
+    else:
+        half_spread_pct = _dynamic_half_spread_pct(cfg, amount_from, rate.usd_price_from, vol_pct)
+    if cfg.objective == "usd" and half_spread_pct != cfg.half_spread_pct:
         log.info(
             "%s/%s %s: dynamic half_spread_pct=%.4f (floor=%.4f, notional=$%.2f, "
             "vol_pct=%s over %.0fm)",
@@ -520,7 +676,7 @@ def run_cycle(
             cfg.kill_switch_window_minutes,
         )
     cfg_for_cycle = dataclasses.replace(
-        cfg, amount_from=amount_from, reserve_usd=None, half_spread_pct=half_spread_pct
+        cfg, amount_from=amount_from, reserve_usd=None, reserve_coin=None, half_spread_pct=half_spread_pct
     )
 
     try:
@@ -546,6 +702,8 @@ def run(cfg: LiveMakerConfig, loop: bool) -> None:
     )
     if cfg.amount_from is not None:
         sizing = f"amount={cfg.amount_from:.8f}"
+    elif cfg.reserve_coin is not None:
+        sizing = f"reserve_coin={cfg.reserve_coin:.8f}"
     else:
         sizing = f"reserve_usd=${cfg.reserve_usd:.2f}"
         if cfg.amount_step is not None:
@@ -564,6 +722,17 @@ def run(cfg: LiveMakerConfig, loop: bool) -> None:
         cfg.kill_switch_long_window_minutes, cfg.kill_switch_long_volatility_pct,
         cfg.kill_switch_cooldown_minutes, cfg.max_source_disagreement_pct, config.db_path,
     )
+    if cfg.objective == "btc":
+        log.info(
+            "objective=btc (%s leg)%s", "restock" if cfg.is_restock_leg else "sell",
+            (
+                f": restock_target_to={cfg.restock_target_to} "
+                f"restock_expected_sell_premium_pct={cfg.restock_expected_sell_premium_pct:.4f} "
+                f"restock_min_half_spread_pct={cfg.restock_min_half_spread_pct:.4f} "
+                f"restock_min_amount_from={cfg.restock_min_amount_from:.8f} "
+                "(half_spread_floor_pct does not apply to this leg)"
+            ) if cfg.is_restock_leg else "",
+        )
 
     try:
         run_cycle(client, conn, cfg, volatility_monitor)
@@ -599,6 +768,37 @@ def main(argv: list[str] | None = None) -> int:
         help="offer everything above this USD value of coin_from, recomputed each cycle against "
         "a live price (e.g. --reserve-usd 210 keeps at least $210 worth back). Exactly one of "
         "--amount-from/--reserve-usd is required.",
+    )
+    parser.add_argument(
+        "--reserve-coin", type=float, default=None,
+        help="like --reserve-usd, but a fixed amount of coin_from (e.g. XMR) kept back, so the "
+        "reserve doesn't move with the coin's USD price. Exactly one of --amount-from/"
+        "--reserve-usd/--reserve-coin is required.",
+    )
+    parser.add_argument(
+        "--objective", default="usd", choices=["usd", "btc"],
+        help="usd (default, unchanged behavior) or btc: cost the spread in sats, and price an "
+        "offer that sells BTC as a restock leg (see the module docstring's Objective note).",
+    )
+    parser.add_argument(
+        "--restock-target-coin-to", type=float, default=None,
+        help="--objective btc restock leg only: total coin_to wallet balance to top up to "
+        "(include any bid-side reserve). --amount-from becomes the per-offer cap, and the "
+        "offer is withdrawn once the wallet is at target.",
+    )
+    parser.add_argument(
+        "--restock-expected-sell-premium-pct", type=float, default=0.0,
+        help="--objective btc restock leg: premium the sell leg is expected to earn, credited "
+        "against the round-trip cost. 0 (default) makes the restock leg cover it all alone.",
+    )
+    parser.add_argument(
+        "--restock-min-half-spread-pct", type=float, default=0.0025,
+        help="--objective btc restock leg: floor for its markup (must be > 0). Replaces "
+        "--half-spread-pct for this leg only.",
+    )
+    parser.add_argument(
+        "--restock-min-amount-from", type=float, default=0.001,
+        help="--objective btc restock leg: don't post a target-limited offer smaller than this.",
     )
     parser.add_argument(
         "--amount-step", type=float, default=None,
@@ -695,8 +895,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    if (args.amount_from is None) == (args.reserve_usd is None):
-        print("Exactly one of --amount-from or --reserve-usd must be given.")
+    if sum(a is not None for a in (args.amount_from, args.reserve_usd, args.reserve_coin)) != 1:
+        print("Exactly one of --amount-from, --reserve-usd or --reserve-coin must be given.")
         return 1
 
     cfg = LiveMakerConfig(
@@ -705,7 +905,13 @@ def main(argv: list[str] | None = None) -> int:
         side=args.side,
         amount_from=args.amount_from,
         reserve_usd=args.reserve_usd,
+        reserve_coin=args.reserve_coin,
         amount_step=args.amount_step,
+        objective=args.objective,
+        restock_target_to=args.restock_target_coin_to,
+        restock_expected_sell_premium_pct=args.restock_expected_sell_premium_pct,
+        restock_min_half_spread_pct=args.restock_min_half_spread_pct,
+        restock_min_amount_from=args.restock_min_amount_from,
         half_spread_pct=args.half_spread_pct,
         assumed_fill_hours=args.assumed_fill_hours,
         reprice_threshold_pct=args.reprice_threshold_pct,
