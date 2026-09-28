@@ -40,6 +40,18 @@ tested, and deployed to both live loops the same day (restarted, verified
 running, existing live offer survived untouched). See `../project_status.md`'s
 matching entry for the design, threshold calibration, and restart verification.
 
+**2026-09-20**: opportunistic bid-scanning (`strategy/bid_scanner.py`,
+`next_steps.md` #9) — bidding into OTHER makers' live offers rather than only
+posting our own — is built and verified read-only against the live node, but
+**not yet run with `--live`** (submitting a real bid starts a real atomic swap
+immediately, a materially less reversible action than posting/revoking our own
+offer). Auditability of OBS's own profitability, independent of the ask/bid
+maker-offer activity above, was an explicit requirement — met via a dedicated
+`bid_scan_events` table plus `reconcile_bid_outcomes()`, which also closes a
+real-outcome-tracking gap `strategy/live_maker.py`'s own docstring used to
+flag as un-built. See `project_status.md`'s and `next_steps.md`'s matching
+2026-09-20 entries.
+
 Same safety posture as `coinbase_dca/`/
 `finance/crypto_yield/`/`copy_trading/` otherwise: personal swaps stay
 human-initiated, no mnemonic/private key is ever generated through or logged

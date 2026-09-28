@@ -34,16 +34,22 @@ Safety notes:
     real-data calibration behind the default. This is the one control decide_and_act's
     own drift-based repricing doesn't cover: reprice chases a moved price
     after the fact every cycle; the kill-switch instead pauses quoting into a
-    market that's still actively moving.
+    market that's still actively moving. 2026-09-24: a second, longer window
+    (cfg.kill_switch_long_window_minutes / _long_volatility_pct) and a
+    cooldown (cfg.kill_switch_cooldown_minutes — once tripped, stay paused
+    until that long passes with no new trip) were added after the 09-18 ask
+    fill showed the 15-min window alone could flicker off for one cycle
+    mid-spike and reprice into the top of the move — see volatility.py's
+    2026-09-24 note for the reconstruction and calibration.
   - Source-disagreement gate (market_maker/next_steps.md #10, built 2026-09-18,
     real incident): the volatility kill-switch only sees trouble *after* a bad
-    reference_mid is already in its rolling window — it did not stop the real
-    2026-09-18 12:24 ask repost that priced 0.008 BTC at 136.17 XMR/BTC, ~6.7%
-    below the ~145 XMR/BTC both CoinGecko and Kraken were independently
-    showing within a minute of that exact post (see project_status.md's
-    matching entry for the full reconstruction — the bad number was isolated
-    to that one live_maker API call, not a real market move or a systemic
-    CoinGecko issue). external_rates.get_reference_rate() already computes an
+    reference_mid is already in its rolling window. Built in response to the
+    2026-09-18 12:24 ask repost at 136.17 XMR/BTC, originally read as a single
+    bad CoinGecko reading — CORRECTED 2026-09-24 (basicswap/project_status.md):
+    both sources agreed, it was a real ~7% move, so this gate wouldn't have
+    stopped it (the kill-switch cooldown/long window above addresses that
+    one). The gate still guards the failure it was designed for, a single bad
+    source reading. external_rates.get_reference_rate() already computes an
     independent Kraken cross-check and a disagreement_pct between it and
     CoinGecko on every call, for every pair with Kraken coverage — this was
     simply never read before using reference_mid. run_cycle now skips
@@ -59,6 +65,63 @@ Safety notes:
     independent source to disagree with, so run_cycle proceeds on CoinGecko
     alone exactly as before, rather than refusing to quote pairs that simply
     have no cross-check available.
+  - Dynamic per-cycle spread (market_maker/next_steps.md #15 Phase A, built
+    2026-09-19): cfg.half_spread_pct is now read as an operator-set FLOOR, not
+    the quoted value itself. Each cycle, run_cycle composes the same
+    VolatilityMonitor reading the kill-switch already computes with
+    economics.dynamic_half_spread_pct (fee + live-vol-scaled buffer + margin,
+    against the cycle's live USD notional) and quotes at
+    max(floor, computed) — so the spread widens automatically during real
+    volatility spikes (a smoother, earlier reaction than the kill-switch's
+    binary skip-the-cycle behavior) and narrows back toward the floor when the
+    market's calm, but never goes thinner than the floor Evan set via
+    --half-spread-pct (next_steps.md #14). Falls back to the floor untouched,
+    unchanged, if this cycle's CoinGecko USD cross wasn't available (no extra
+    external call is made just to recover it) — an enhancement failing never
+    blocks quoting outright, same posture as every other guard in this module.
+    The exposure window used to scale the volatility buffer is
+    cfg.assumed_fill_hours, a separate static guess from cfg.lock_hours (the
+    offer's technical HTLC ceiling) — see next_steps.md #15 Phase C for why
+    it's still a guess, not a real measurement, and dynamic_half_spread_pct's
+    own docstring for why the two "lock hours" concepts are unrelated despite
+    the shared name.
+  - 2026-09-25 incident fixes (market_maker/project_status.md's matching
+    entry): (1) PRICING DIRECTION. This used quoter.half_spread_rate, whose
+    'bid' branch quotes mid*(1-h) — correct in the shadow quoter, where both
+    sides are expressed in the ask pair's units, but wrong here: the bid side
+    flips the pair (coin_from=xmr, coin_to=btc), so its rate is BTC per XMR,
+    and mid*(1-h) SOLD XMR 2-3% BELOW market (five takers in an hour on
+    09-25; the 09-18 bid fill's -0.77% edge was the same bug). A BasicSwap
+    offer always sells coin_from, so the only correct rate is
+    _offer_rate()'s mid*(1+h), whatever cfg.side says; decide_and_act also
+    refuses to post anything at or below mid. (2) IN-FLIGHT SWAPS. The wallet
+    balance doesn't drop until our lock tx publishes, and each reprice posts
+    a fresh offer (BasicSwap's max_concurrent_bids=1 is per offer), so the
+    same surplus was sold twice, cutting into the --reserve-usd floor, and
+    three more accepted swaps sat retrying a lock we couldn't fund.
+    run_cycle now checks /json/bids first: while any non-terminal swap sells
+    coin_from for coin_to, it posts nothing, revokes our live offer in that
+    direction (so a second taker can't start a parallel swap), and waits.
+  - Offer-size quantization (cfg.amount_step, built 2026-09-20, stolen from
+    BasicSwap's own built-in "AMM" offer-posting bot, scripts/createoffers.py
+    — see that script's own template docs: "amount_step: REQUIRED - Offer
+    size increment for privacy"). Only relevant to --reserve-usd sizing:
+    --amount-from is a fixed constant regardless of wallet balance, so it
+    never leaks anything about the wallet. --reserve-usd, by contrast,
+    computes "everything above the reserve" fresh each cycle in
+    _resolve_amount_from — offered at the *exact* leftover value unless
+    quantized, which hands anyone watching the offer book a precise reading
+    of the wallet's balance (offer_amount + reserve_usd/price ~= wallet
+    balance, to eight decimals). When cfg.amount_step is set,
+    _resolve_amount_from rounds the dynamic amount DOWN to the nearest whole
+    multiple of the step (matching createoffers.py's own
+    `min_offer_amount * min_steps` logic exactly) before it ever reaches
+    decide_and_act, so the posted amount only ever discloses "wallet balance
+    is somewhere in this step-wide bracket," not the exact figure. Opt-in
+    (default None — disabled, current live behavior unchanged) rather than
+    on-by-default, matching this module's standing posture that a live-money
+    behavior change needs Evan to actually pass the flag on the next
+    restart, not just have it built.
 """
 
 import argparse
@@ -67,11 +130,10 @@ import logging
 import time
 from dataclasses import dataclass
 
-from . import coin_names, external_rates, storage
+from . import coin_names, economics, external_rates, storage
 from .api_client import BasicSwapAPIError, BasicSwapClient
 from .config import load_config
 from .external_rates import ExternalRateError
-from .quoter import half_spread_rate
 from .volatility import VolatilityMonitor
 
 log = logging.getLogger("basicswap.strategy.live_maker")
@@ -87,23 +149,65 @@ class LiveMakerConfig:
     coin_from: str
     coin_to: str
     side: str
-    half_spread_pct: float
+    half_spread_pct: float  # read as a FLOOR, not the quoted value — see run_cycle's dynamic-spread note
     reprice_threshold_pct: float
     offer_valid_hours: float  # our own repricing cadence backstop
     lock_hours: float  # the offer's own HTLC lock window
     valid_hours: float  # the offer's own BasicSwap-enforced expiry (a backstop under ours)
     amount_from: float | None = None  # fixed offer size; mutually exclusive with reserve_usd
     reserve_usd: float | None = None  # "offer everything above this USD value" — see _dynamic_amount_from
+    amount_step: float | None = None  # quantize --reserve-usd's dynamic amount down to this — see module docstring
     automation_strat_id: int | None = 1
     kill_switch_window_minutes: float = 15.0  # rolling window volatility.VolatilityMonitor evaluates
     kill_switch_volatility_pct: float = 0.0085  # see volatility.py's module docstring for calibration
+    # 2026-09-24 (volatility.py's recalibration note): a longer window that one flat
+    # reading can't clear, plus hysteresis. <= 0 disables either.
+    kill_switch_long_window_minutes: float = 60.0
+    kill_switch_long_volatility_pct: float = 0.03
+    kill_switch_cooldown_minutes: float = 30.0
     max_source_disagreement_pct: float = 0.015  # see run_cycle's docstring note below for calibration
+    # next_steps.md #15 Phase A: the exposure window the dynamic spread's volatility
+    # buffer is sized off — a static guess (midpoint of the "2-3h realistic fill"
+    # estimate next_steps.md #14's 0.02 derivation used), unrelated to lock_hours
+    # above (the offer's technical HTLC ceiling). Stays a guess until #15 Phase C
+    # measures real fill times.
+    assumed_fill_hours: float = 2.5
 
     def __post_init__(self):
         has_fixed = self.amount_from is not None
         has_reserve = self.reserve_usd is not None
         if has_fixed == has_reserve:
             raise ValueError("exactly one of amount_from or reserve_usd must be set")
+
+
+# Mirrors bid_scanner._TERMINAL_*: any other bid_state is a swap still in
+# progress (or a bid still pending acceptance), which can still move funds.
+_TERMINAL_BID_STATES = {
+    "Completed", "Timed-out", "Abandoned", "Error", "Rejected", "Expired",
+    "Auto accept failed", "Failed", "Failed, refunded", "Failed, swiped",
+    "Failed, swiped, sending mercy", "Failed, swiped, recovering",
+    "Failed, swiped, recovered", "Failed, swiped, mercy unused",
+}
+
+
+def _offer_rate(reference_mid: float, half_spread_pct: float) -> float:
+    """Rate (coin_to per coin_from) for an offer that sells coin_from. Always
+    above mid: the offer's direction is already encoded in coin_from/coin_to,
+    so cfg.side must not flip the sign (see the 2026-09-25 note above)."""
+    return reference_mid * (1 + half_spread_pct)
+
+
+def _in_flight_swaps(client: BasicSwapClient, coin_from: str, coin_to: str) -> list[dict]:
+    """Non-terminal bids that sell coin_from for coin_to, i.e. swaps on our own
+    offers in this direction that could still take funds from the wallet. Also
+    matches a bid we SENT into someone else's offer in the same direction
+    (bid_scanner); that over-blocks, which is the safe way to be wrong."""
+    cf, ct = coin_names.to_display_name(coin_from), coin_names.to_display_name(coin_to)
+    return [
+        b for b in client.get_bids()
+        if b.get("coin_from") == cf and b.get("coin_to") == ct
+        and b.get("bid_state") not in _TERMINAL_BID_STATES
+    ]
 
 
 class InsufficientBalanceError(RuntimeError):
@@ -147,7 +251,12 @@ def decide_and_act(
 ) -> str | None:
     now = now if now is not None else time.time()
     coin_from, coin_to = coin_names.to_display_name(cfg.coin_from), coin_names.to_display_name(cfg.coin_to)
-    target_rate = half_spread_rate(reference_mid, cfg.half_spread_pct, cfg.side)
+    target_rate = _offer_rate(reference_mid, cfg.half_spread_pct)
+    if not target_rate > reference_mid:
+        raise ValueError(
+            f"refusing to quote {coin_from}->{coin_to} at {target_rate} <= reference mid "
+            f"{reference_mid}: an offer always sells coin_from, so this would sell below market"
+        )
     target_rate_str = f"{target_rate:.8f}"
     amount_str = f"{cfg.amount_from:.8f}"
 
@@ -265,12 +374,66 @@ def _resolve_amount_from(client: BasicSwapClient, cfg: LiveMakerConfig) -> float
     dynamic_amount = available - reserve_coin
     if dynamic_amount <= 0:
         log.info(
-            "%s: %.8f available, reserving %.8f (~$%.2f at $%.2f/coin) — nothing free to offer "
+            "%s: balance %.8f, reserve %.8f (~$%.2f at $%.2f/coin) — nothing free to offer "
             "this cycle, any existing live offer is left untouched.",
             cfg.coin_from, available, reserve_coin, cfg.reserve_usd, usd_price,
         )
         return None
+
+    if cfg.amount_step is not None and cfg.amount_step > 0:
+        steps = int(dynamic_amount / cfg.amount_step)
+        quantized_amount = cfg.amount_step * steps
+        if quantized_amount <= 0:
+            log.info(
+                "%s: %.8f available above reserve, but below one amount_step (%.8f) — nothing "
+                "to offer this cycle, any existing live offer is left untouched.",
+                cfg.coin_from, dynamic_amount, cfg.amount_step,
+            )
+            return None
+        return quantized_amount
+
     return dynamic_amount
+
+
+def _dynamic_half_spread_pct(
+    cfg: LiveMakerConfig, amount_from: float, usd_price_from: float | None, vol_pct: float | None
+) -> float:
+    """next_steps.md #15 Phase A: this cycle's half_spread_pct, composing the live
+    volatility reading with economics.py's cost model — see the module docstring's
+    "Dynamic per-cycle spread" note for the full picture. Falls back to
+    cfg.half_spread_pct (the floor) untouched if usd_price_from isn't available this
+    cycle (CoinGecko's USD cross failed) — deliberately makes no extra external call
+    here to recover it, only composes what this cycle already fetched."""
+    if usd_price_from is None:
+        return cfg.half_spread_pct
+    notional_usd = amount_from * usd_price_from
+    return economics.dynamic_half_spread_pct(
+        operator_floor_pct=cfg.half_spread_pct,
+        notional_usd=notional_usd,
+        lock_hours=cfg.assumed_fill_hours,
+        live_vol_pct=vol_pct,
+        live_vol_window_seconds=cfg.kill_switch_window_minutes * 60,
+    )
+
+
+def _pause_for_in_flight_swaps(client: BasicSwapClient, cfg: LiveMakerConfig, in_flight: list[dict]) -> None:
+    ids = ", ".join(f"{b.get('bid_id', '?')[:16]} ({b.get('bid_state')})" for b in in_flight)
+    try:
+        live = _find_own_live_offer(client, cfg.coin_from, cfg.coin_to)
+        if live is not None:
+            client.revoke_offer(live["offer_id"], refuse_if_negotiating=True)
+            log.warning(
+                "%s/%s %s: revoked live offer %s so no second taker can start a parallel swap",
+                cfg.coin_from, cfg.coin_to, cfg.side, live["offer_id"],
+            )
+    except (BasicSwapAPIError, AmbiguousLiveOffersError) as e:
+        log.warning("%s/%s %s: couldn't revoke live offer while a swap is in flight: %s",
+                    cfg.coin_from, cfg.coin_to, cfg.side, e)
+    log.warning(
+        "%s/%s %s: %d swap(s) in flight [%s] — not posting until they finish; the wallet "
+        "balance doesn't reflect them yet.",
+        cfg.coin_from, cfg.coin_to, cfg.side, len(in_flight), ids,
+    )
 
 
 def run_cycle(
@@ -299,24 +462,65 @@ def run_cycle(
 
     now = time.time()
     volatility_monitor.add(now, reference_mid)
-    vol_pct = volatility_monitor.volatility_pct()
+    vol_pct = volatility_monitor.volatility_pct(cfg.kill_switch_window_minutes * 60)
+    trips = []
     if vol_pct is not None and vol_pct > cfg.kill_switch_volatility_pct:
-        log.warning(
-            "%s/%s %s: volatility kill-switch active (%.3f%% move over the last %.0fm exceeds "
-            "%.3f%% threshold) — skipping post/reprice this cycle, any existing live offer is "
-            "left untouched.",
-            cfg.coin_from, cfg.coin_to, cfg.side, vol_pct * 100,
-            cfg.kill_switch_window_minutes, cfg.kill_switch_volatility_pct * 100,
+        trips.append(
+            f"{vol_pct * 100:.3f}% move over the last {cfg.kill_switch_window_minutes:.0f}m "
+            f"exceeds {cfg.kill_switch_volatility_pct * 100:.3f}%"
         )
+    if cfg.kill_switch_long_window_minutes > 0 and cfg.kill_switch_long_volatility_pct > 0:
+        long_vol_pct = volatility_monitor.volatility_pct(cfg.kill_switch_long_window_minutes * 60)
+        if long_vol_pct is not None and long_vol_pct > cfg.kill_switch_long_volatility_pct:
+            trips.append(
+                f"{long_vol_pct * 100:.3f}% move over the last "
+                f"{cfg.kill_switch_long_window_minutes:.0f}m exceeds "
+                f"{cfg.kill_switch_long_volatility_pct * 100:.3f}%"
+            )
+    if trips:
+        volatility_monitor.last_trip_at = now
+        log.warning(
+            "%s/%s %s: volatility kill-switch active (%s) — skipping post/reprice this cycle, "
+            "any existing live offer is left untouched.",
+            cfg.coin_from, cfg.coin_to, cfg.side, "; ".join(trips),
+        )
+        return
+    cooldown_seconds = cfg.kill_switch_cooldown_minutes * 60
+    if volatility_monitor.cooling_down(now, cooldown_seconds):
+        log.warning(
+            "%s/%s %s: volatility kill-switch cooling down (last tripped %.0fs ago, %.0fm "
+            "cooldown) — skipping post/reprice this cycle, any existing live offer is left "
+            "untouched.",
+            cfg.coin_from, cfg.coin_to, cfg.side, now - volatility_monitor.last_trip_at,
+            cfg.kill_switch_cooldown_minutes,
+        )
+        return
+
+    try:
+        in_flight = _in_flight_swaps(client, cfg.coin_from, cfg.coin_to)
+    except BasicSwapAPIError as e:
+        log.warning("get_bids failed, skipping this cycle (can't rule out an in-flight swap): %s", e)
+        return
+    if in_flight:
+        _pause_for_in_flight_swaps(client, cfg, in_flight)
         return
 
     amount_from = _resolve_amount_from(client, cfg)
     if amount_from is None:
         return
-    cfg_for_cycle = (
-        cfg
-        if cfg.amount_from is not None
-        else dataclasses.replace(cfg, amount_from=amount_from, reserve_usd=None)
+
+    half_spread_pct = _dynamic_half_spread_pct(cfg, amount_from, rate.usd_price_from, vol_pct)
+    if half_spread_pct != cfg.half_spread_pct:
+        log.info(
+            "%s/%s %s: dynamic half_spread_pct=%.4f (floor=%.4f, notional=$%.2f, "
+            "vol_pct=%s over %.0fm)",
+            coin_names.to_display_name(cfg.coin_from), coin_names.to_display_name(cfg.coin_to),
+            cfg.side, half_spread_pct, cfg.half_spread_pct, amount_from * rate.usd_price_from,
+            f"{vol_pct * 100:.3f}%" if vol_pct is not None else "n/a",
+            cfg.kill_switch_window_minutes,
+        )
+    cfg_for_cycle = dataclasses.replace(
+        cfg, amount_from=amount_from, reserve_usd=None, half_spread_pct=half_spread_pct
     )
 
     try:
@@ -337,17 +541,28 @@ def run(cfg: LiveMakerConfig, loop: bool) -> None:
         timeout_seconds=config.request_timeout_seconds,
     )
     conn = storage.connect(config.db_path)
-    volatility_monitor = VolatilityMonitor(window_seconds=cfg.kill_switch_window_minutes * 60)
-    sizing = f"amount={cfg.amount_from:.8f}" if cfg.amount_from is not None else f"reserve_usd=${cfg.reserve_usd:.2f}"
+    volatility_monitor = VolatilityMonitor(
+        window_seconds=max(cfg.kill_switch_window_minutes, cfg.kill_switch_long_window_minutes) * 60
+    )
+    if cfg.amount_from is not None:
+        sizing = f"amount={cfg.amount_from:.8f}"
+    else:
+        sizing = f"reserve_usd=${cfg.reserve_usd:.2f}"
+        if cfg.amount_step is not None:
+            sizing += f" amount_step={cfg.amount_step:.8f}"
     log.info(
-        "LIVE market-making: %s/%s %s, %s half_spread_pct=%.4f "
-        "reprice_threshold_pct=%.4f offer_valid_hours=%.2f lock_hours=%.1f valid_hours=%.1f "
+        "LIVE market-making: %s/%s %s, %s half_spread_floor_pct=%.4f "
+        "assumed_fill_hours=%.2f reprice_threshold_pct=%.4f offer_valid_hours=%.2f "
+        "lock_hours=%.1f valid_hours=%.1f "
         "automation_strat_id=%s kill_switch_window_minutes=%.1f kill_switch_volatility_pct=%.4f "
-        "max_source_disagreement_pct=%.4f db=%s",
+        "kill_switch_long_window_minutes=%.1f kill_switch_long_volatility_pct=%.4f "
+        "kill_switch_cooldown_minutes=%.1f max_source_disagreement_pct=%.4f db=%s",
         cfg.coin_from, cfg.coin_to, cfg.side, sizing, cfg.half_spread_pct,
-        cfg.reprice_threshold_pct, cfg.offer_valid_hours, cfg.lock_hours, cfg.valid_hours,
+        cfg.assumed_fill_hours, cfg.reprice_threshold_pct, cfg.offer_valid_hours,
+        cfg.lock_hours, cfg.valid_hours,
         cfg.automation_strat_id, cfg.kill_switch_window_minutes, cfg.kill_switch_volatility_pct,
-        cfg.max_source_disagreement_pct, config.db_path,
+        cfg.kill_switch_long_window_minutes, cfg.kill_switch_long_volatility_pct,
+        cfg.kill_switch_cooldown_minutes, cfg.max_source_disagreement_pct, config.db_path,
     )
 
     try:
@@ -386,18 +601,54 @@ def main(argv: list[str] | None = None) -> int:
         "--amount-from/--reserve-usd is required.",
     )
     parser.add_argument(
-        "--half-spread-pct", type=float, default=0.011,
-        # Raised from 0.0066 -> 0.011 on 2026-09-19: the project's two real
-        # automated fills to date (2026-09-18) both realized *below* fair
-        # value — one a ~6.7% pricing bug (fixed separately), the other a
-        # ~0.3-0.4% adverse move from ordinary quote-to-fill price drift,
-        # which the old 0.66% spread barely covered once the ~$0.50-1.50
-        # on-chain fee was netted out. 0.011 covers this pair's own
-        # real-data-calibrated 15-min p99 move (0.84%, volatility.py's 512-
-        # sample calibration) plus the fee, while the resulting ~2.2%
-        # effective two-sided spread stays close to this market's own
-        # observed historical median two-sided spread (~2.05-2.09%,
-        # poller.py's Phase 1 analysis) rather than pricing us out of it.
+        "--amount-step", type=float, default=None,
+        help="only used with --reserve-usd: quantize the dynamic offer amount DOWN to the "
+        "nearest whole multiple of this (coin_from units) before posting, so the posted "
+        "amount doesn't disclose the wallet's exact leftover balance to anyone watching the "
+        "offer book — see live_maker.py's module docstring. Default None (disabled, current "
+        "behavior unchanged): pass this explicitly to turn it on.",
+    )
+    parser.add_argument(
+        "--half-spread-pct", type=float, default=0.02,
+        # Raised 0.011 -> 0.02 on 2026-09-19 (Evan's explicit "fix the BS
+        # rate" call), after finding the 0.011 justification above was
+        # itself miscalibrated: it compared our *round-trip-equivalent*
+        # (2x half_spread = 2.2%) against this market's *two-sided* median
+        # spread (~2.05-2.09%) as if that were the profitability bar. It
+        # isn't -- `economics.py`'s already-built, already-researched cost
+        # model is the actual bar for a SINGLE-sided fill (which is what
+        # live_maker.py actually exposes itself to, one side at a time):
+        # fee_pct + vol_buffer_pct(actual lock/fill hours) + margin_pct,
+        # compared *directly* against half_spread_pct, no /2. Run at our
+        # real ~$880 notional with today's fee assumptions
+        # (required_spread_pct in economics.py), even a fast 30-min fill
+        # needs ~1.35% one-sided to cover fee+risk+margin -- already above
+        # the old 0.011 -- and a more realistic 2-3h fill (plausible given
+        # Monero's own confirmation requirements) needs ~2.0-2.3%. This
+        # independently converges with `next_steps.md` #14's cross-venue
+        # read (Eigen ASB's competitive tier: median 2.67% one-sided
+        # markup; Bisq: median 4.64%) and with this project's actual P&L
+        # so far (all 3 real fills have been losses). 0.02 sits just above
+        # the "realistic fill time" cost-model bar, below Eigen ASB's
+        # professional-tier benchmark, and meaningfully wider than the old
+        # value -- a deliberate correction, not a guess. Real fill time
+        # (BasicSwap's own `next_steps.md` §4(a)/§5) is still unmeasured,
+        # so this remains a revisit-when-real-fill-data-exists number, not
+        # a final one -- see `next_steps.md` #14's follow-on plan for
+        # moving toward a data-driven, continuously-recalibrated value.
+        # 2026-09-19, next_steps.md #15 Phase A: this is now read as a FLOOR, not
+        # the quoted value itself -- run_cycle computes a per-cycle spread off the
+        # live volatility reading + economics.py's cost model and quotes at
+        # max(this floor, that computed value), so the real quoted spread can be
+        # wider than this number but never thinner.
+    )
+    parser.add_argument(
+        "--assumed-fill-hours", type=float, default=2.5,
+        help="next_steps.md #15 Phase A: static guess for the exposure window the "
+        "dynamic spread's volatility buffer is sized off (midpoint of the '2-3h "
+        "realistic fill' estimate --half-spread-pct's own 0.02 derivation used) -- "
+        "NOT the same thing as --lock-hours (the offer's technical HTLC ceiling). "
+        "Stays a guess until Phase C measures real fill times.",
     )
     parser.add_argument("--reprice-threshold-pct", type=float, default=0.005)
     parser.add_argument("--offer-valid-hours", type=float, default=0.7, help="our own reprice-cadence backstop")
@@ -412,6 +663,21 @@ def main(argv: list[str] | None = None) -> int:
         "--kill-switch-volatility-pct", type=float, default=0.0085,
         help="(max-min)/mean over the window above which posting/reposting is skipped for "
         "that cycle; default calibrated from real poller history, see volatility.py",
+    )
+    parser.add_argument(
+        "--kill-switch-long-window-minutes", type=float, default=60.0,
+        help="second, longer kill-switch window (<= 0 disables) — see volatility.py's "
+        "2026-09-24 note",
+    )
+    parser.add_argument(
+        "--kill-switch-long-volatility-pct", type=float, default=0.03,
+        help="(max-min)/mean over the long window above which quoting pauses (<= 0 disables); "
+        "default ~p95 of a real week of 60-min ranges",
+    )
+    parser.add_argument(
+        "--kill-switch-cooldown-minutes", type=float, default=30.0,
+        help="after any kill-switch trip, stay paused until this long passes with no new "
+        "trip (0 disables)",
     )
     parser.add_argument(
         "--max-source-disagreement-pct", type=float, default=0.015,
@@ -439,7 +705,9 @@ def main(argv: list[str] | None = None) -> int:
         side=args.side,
         amount_from=args.amount_from,
         reserve_usd=args.reserve_usd,
+        amount_step=args.amount_step,
         half_spread_pct=args.half_spread_pct,
+        assumed_fill_hours=args.assumed_fill_hours,
         reprice_threshold_pct=args.reprice_threshold_pct,
         offer_valid_hours=args.offer_valid_hours,
         lock_hours=args.lock_hours,
@@ -447,6 +715,9 @@ def main(argv: list[str] | None = None) -> int:
         automation_strat_id=args.automation_strat_id,
         kill_switch_window_minutes=args.kill_switch_window_minutes,
         kill_switch_volatility_pct=args.kill_switch_volatility_pct,
+        kill_switch_long_window_minutes=args.kill_switch_long_window_minutes,
+        kill_switch_long_volatility_pct=args.kill_switch_long_volatility_pct,
+        kill_switch_cooldown_minutes=args.kill_switch_cooldown_minutes,
         max_source_disagreement_pct=args.max_source_disagreement_pct,
     )
     try:

@@ -1,6 +1,6 @@
 # Market Maker — Project Status
 
-**Status as of 2026-09-18: one live venue (BasicSwap), real money, real
+**Latest: see the 2026-09-24 handoff at the end of this file.** Status as of 2026-09-18: one live venue (BasicSwap), real money, real
 fills, now with its own GitHub repo. Three safety controls built and
 deployed this session: a volatility kill-switch (#1), a duplicate-instance
 PID guard (#9), and a source-disagreement gate (#10) — the last one built
@@ -471,6 +471,314 @@ fallbacks. Zero quotes so far, not because there's no path forward, but
 because neither dial path currently completes. Concrete next step (add real
 WebSocket transport support) is scoped, not started.
 
+## 2026-09-19, later the same day: Eigen ASB WebSocket transport fixed and verified — new, deeper blocker found (`next_steps.md` #13)
+
+Picked this session up from the entry above. Confirmed the live_maker
+restart from earlier that day had actually landed (`half_spread_pct=0.0110`
+in both processes' fresh startup logs, matching the 09-19 11:41/11:42
+timestamps) before starting new work, per the session-start checklist.
+
+**Built the scoped fix**: ported `swap/src/cli/transport.rs::new()`'s
+transport shape — a `websocket::WsConfig`-wrapped Tor-or-TCP+DNS transport
+combined via `.or_transport()` with a plain Tor-or-TCP+DNS transport, `ws`
+first so it claims `/wss` addresses before the plain transport can eagerly
+grab them — into `fetch_quotes_json.rs`'s `create_transport()`, instead of
+guessing at a fix; the production binary already solved this exact problem.
+Added libp2p's `websocket` feature to `swap-p2p`'s dev-dependencies.
+Compiles clean.
+
+**Verified live, not just compiled**: real `wss` connections now establish
+to 2 of 4 clearnet rendezvous nodes — previously this path never connected
+at all. Confirmed the fix isn't Tor-dependent (`FETCH_QUOTES_USE_TOR=0`
+gives the same result, dialing the same `wss` addresses directly). The other
+2 clearnet nodes and all 4 onion addresses still fail, but for reasons
+already distinct from this fix and from each other (one Cloudflare-style
+handshake rejection, one DNS `NXDomain`, four onion HSDir lookup failures) —
+not new problems, not this fix's responsibility.
+
+**New finding**: even over a successful `wss` connection, the rendezvous
+`discover` request itself still fails (`error=Unavailable`) — but `identify`
+succeeds first on the *same* connection, isolating the failure to the
+rendezvous protocol layer specifically, not the transport or connection as a
+whole. Traced `Unavailable` to `libp2p-rendezvous`'s own generic fallback
+for any outbound request failure (not a real "zero registrations" server
+response). One real, unconfirmed lead: the `identify` response's
+`observed_addr` for us comes back as a Docker-internal IP, suggesting these
+nodes sit behind a reverse proxy that may be mishandling the `discover`
+substream specifically. Full detail, the ruled-in/ruled-out list, and the
+concrete next diagnostic step are in `next_steps.md` #13 — not repeated
+here. Quotes still aren't flowing; no production Python client
+(`venues/eigen_asb/`) built yet, correctly, per this item's own standing
+gate.
+
+## 2026-09-19, later still: Eigen ASB `discover` root-caused — a known, already-fixed-upstream `quick-protobuf` codec bug (`next_steps.md` #13)
+
+Picked up straight from the entry above ("new blocker" = rendezvous
+`discover` failing with `error=Unavailable` even over a working `wss`
+connection). Per that entry's own "concrete next step," got real wire-level
+visibility instead of inferring further from the generic error code: patched
+a local vendored copy of the `libp2p-rendezvous` 0.14.0 crate (via a
+scratchpad-only `[patch.crates-io]` path override — not committed anywhere)
+to log the real `OutboundFailure` before `client.rs` discards it, and the raw
+response bytes before the protobuf decode consumes them.
+
+**Result**: the real error is a `quick-protobuf` decode failure
+(`Io(InvalidData: Deprecated("group"))`), not a network/proxy issue — and a
+byte-by-byte manual re-parse of the captured 9020-byte response against this
+crate's own `rpc.proto` schema shows it's a **perfectly well-formed
+message** (32 real ASB registrations, correct to the last byte). The bug is
+that `quick-protobuf-codec`'s decoder expects an extra length-prefix varint
+the live server doesn't send, so it misreads the real message's own first
+byte as a bogus 8-byte length and chokes on it immediately.
+
+**Why, not just what**: checked `libp2p-rendezvous`'s real release history
+live (crates.io + upstream `rust-libp2p` CHANGELOG) — version 0.18.0,
+published 2026-09-11 (8 days before this session), reads verbatim "Revert
+migration to `quick-protobuf`, migrate back to `prost`." This workspace pins
+`libp2p 0.53.2`, resolving to the old, pre-revert, `quick-protobuf`-based
+0.14.0 — exactly the version just traced the bug in. The live rendezvous
+nodes are almost certainly running server code built against the newer,
+`prost`-based release.
+
+**Not fixed here, correctly**: the real fix is a workspace-wide `libp2p`
+version bump (shared across 10+ crates in this large upstream fork), not a
+local patch — a scoping decision for Evan, not a code task this session
+should just do. No production Python client built; standing gate unchanged.
+Full derivation, the exact byte-level trace, and the debugging-patch
+locations are in `next_steps.md` #13 (its status line changed from "blocked
+on a rendezvous-protocol gap" to "root cause found, blocked on a dependency
+bump decision").
+
+## 2026-09-19, later still: libp2p bumped on Evan's go-ahead — Eigen ASB quotes flowing for the first time (`next_steps.md` #13)
+
+Evan explicitly authorized the dependency bump the root-cause entry above
+identified as the real fix. Bumped the workspace `libp2p` pin 0.53.2→0.57.0
+(pulls in the `prost`-based `libp2p-rendezvous` 0.18.0 that fixed the bug),
+removed the now-irrelevant temporary debugging patch. `cargo update`
+resolved cleanly; building `swap-p2p` surfaced 43 real compile errors from
+the libp2p API migration — all mechanical, all confined to this project's
+own `swap-p2p`/`libp2p-tor` source (a new `PortUse` param on
+`handle_established_outbound_connection`, new non-exhaustive fields on a
+couple of request-response/identify event variants, a `Void`→`Infallible`
+swap, and two `Transport` trait methods removed in favor of a `DialOpts`
+param). Fixed all of them; clean build.
+
+**Verified live immediately after**: real price quotes from **11 distinct
+live Eigen ASBs** — not just registrations, actual quotes. First snapshot:
+8 clustered around 0.0068 BTC/XMR, 3 priced 17–25% above that cluster — a
+real, immediate hint of maker mispricing on this venue too, one snapshot
+only, not yet a trend. Full detail in `next_steps.md` #13.
+
+**Not done**: no persistence, no schedule, no Python `OfferBookReader`
+integration — the standing "no production client until quotes flow" gate
+is cleared, but building the actual `venues/eigen_asb/` integration is new
+scope Evan hasn't asked for yet. The Rust fix lives only in this session's
+scratchpad clone, not copied into this repo.
+
+## 2026-09-19, later still: Eigen ASB built, run, and scheduled — deployed, same shape as Bisq (`next_steps.md` #13)
+
+Evan asked to "build, run, and schedule what we need to understand the
+profitability of eigen." Closed out `next_steps.md` #13 completely, mirroring
+#12's (Bisq) shape:
+
+- **Built** `venues/eigen_asb/client.py` (subprocess wrapper around the
+  compiled Rust binary — no HTTP API exists for this venue) and `reader.py`
+  (`EigenAsbOfferBookReader`). Confirmed the field-unit mapping against
+  `swap-p2p`'s own `BidQuote` source rather than guessing: `price`/
+  `min_quantity`/`max_quantity` are all BTC units, converted to XMR
+  (`coin_from`) units via `price` per `NormalizedOffer`'s contract.
+  Registered in `poller.py`'s registry and `config.py`'s default venue list.
+  14 new tests, `venues/` suite now 29/29.
+- **The compiled binary now lives permanently at `~/eigenwallet-core`**
+  (release build) — a sibling to `~/coinswaps`, no longer scratchpad-scoped.
+- **Verified live twice**: a manual run (11 real ASB quotes, correct
+  BTC→XMR unit conversion), then **the real production
+  `com.market_maker.venues-poller` launchd job picked up the change on its
+  own next 5-minute cycle and wrote 11 real rows into the actual
+  `~/coinswaps/venue_observations.db`** — no plist edit, no reload, proving
+  the registry design worked exactly as intended.
+- **A real early finding, later corrected**: 8 of 11 ASBs cluster tightly
+  (~0.0068 BTC/XMR); the other 3 are 17–29% above that. The original claim
+  that all 3 outliers reported `0`/`0` liquidity was wrong — only 2 do; the
+  3rd has real, tiny, tradeable size — see this file's later 2026-09-19
+  entry for the correction and the full cross-venue analysis.
+- **Scheduled**: no new plist — reuses the existing 5-minute
+  `com.market_maker.venues-poller.plist`. History now accumulates toward
+  the same 1–2 week bar this project uses elsewhere before treating a
+  number as real. Full detail in `next_steps.md` #13.
+
+## 2026-09-19, later still: the Eigen ASB price-outlier finding, root-caused precisely (`next_steps.md` #13)
+
+Evan asked why the outlier ASB quotes (17–25% above the 8-ASB cluster)
+aren't a real opportunity, rather than accepting the earlier session's
+hand-wavy "likely stale/default configs" guess at face value. Verified it
+properly instead of restating the guess: read the reference ASB's own
+quote-generation source (`~/eigenwallet-core/swap/src/asb/event_loop.rs`'s
+`make_quote()`). It computes its price fresh from a real rate feed
+(Kraken/Bitfinex/KuCoin/Exolix average + spread, or occasionally a fixed
+rate) *before* any balance check, then explicitly zeroes both
+`min_quantity` and `max_quantity` when its own unreserved Monero balance
+can't cover even its configured minimum swap size — a genuine, real-time
+"I'm out of usable Monero" signal, not a stale config. Because a real swap
+needs an amount inside `[min_quantity, max_quantity]`, a `[0, 0]` range is
+mathematically untradeable regardless of how attractive the price looks —
+unlike #10's real BasicSwap incident, where the mispriced offer *was*
+fillable. **Applies to only 2 of the original 3 outliers, not all 3** — see
+the next entry for the correction, found the same session by pulling a
+second fresh sample to double-check rather than trusting the first
+inference. Full derivation, including the one honest caveat (can't fully
+rule out operator rate-feed/spread differences also contributing to some
+of the divergence), is in `next_steps.md` #13.
+
+## 2026-09-19, later still: correction + cross-venue spread/size analysis (`next_steps.md` #14)
+
+Evan then asked what we can learn from how others have set up their
+offers. Pulled fresh live data from both venues against a real
+CoinGecko/Kraken reference rate rather than reasoning abstractly, and in
+the process caught and corrected a factual error already written into
+three docs (this file, `next_steps.md`, and the root workspace `CLAUDE.md`):
+the claim that all 3 price outliers had `0`/`0` liquidity was wrong. Only 2
+do (`xmr.swapexchange.club`, `bestchange24.duckdns.org` — the zero-liquidity
+mechanism above applies cleanly to these). The 3rd (`pulse.mikaswap.com`)
+has real, nonzero, tradeable size (~0.00005–0.035 BTC) at a persistent
+~27–29% markup across two samples 2 hours apart — read as a deliberate
+wide-spread/thin-size "premium" posture, not a bug, though not enough
+samples to be certain.
+
+**The real finding, cross-venue**: computed the same markup-over-fair-value
+metric for Eigen ASB (11 live ASBs) and Bisq (113 live sell-side offers).
+Eigen ASB splits into a competitive tier (8/11, median +2.67% markup,
+0.035–12 BTC size) and the two exceptions above; Bisq is wider and far
+more dispersed (median +4.64%, p10 +1.9% to p90 +14.2%). Lined up against
+BasicSwap's own live 1.1% ask spread and its own platform's previously-
+measured median (~2.06%, `next_steps.md` #11), **all three independent
+real-market reference points sit above our current price** — worth Evan's
+attention alongside the fact that all three of this project's real fills
+so far have been losses, and that the bid side was already widened
+0.66%→1.1% earlier the same session for exactly this kind of reason.
+**Not changed unilaterally** — flagged for Evan's decision, same posture
+as every other live-pricing change in this project. Full tables and
+derivation in `next_steps.md` #14.
+
+## 2026-09-19, later still: "fix the BS rate" — half_spread_pct corrected and deployed, pricing roadmap laid out (`next_steps.md` #14/#15)
+
+Evan asked to fix the BasicSwap spread and lay out next steps for using all
+this session's data (BasicSwap's own book, Eigen ASB, Bisq,
+`economics.py`'s cost model) to price both responsively per-market and
+consistently across markets.
+
+**The fix**: found the previous `half_spread_pct=0.011` justification was
+itself miscalibrated — it compared a round-trip-equivalent against
+BasicSwap's own *two-sided* market median as the bar, when `live_maker.py`
+only ever exposes itself to one side of a fill at a time. The correct,
+same-unit bar is `basicswap/strategy/economics.py`'s already-built
+`required_spread_pct` compared directly against `half_spread_pct`. Run at
+our real ~$880 notional: even a 30-minute fill needs ~1.35% one-sided to
+break even with margin, a realistic 2–3h fill needs ~2.0–2.3% — converging
+independently with #14's cross-venue read (Eigen ASB competitive tier
+2.67%, Bisq 4.64%). Raised the default to 0.02, 98/98 tests still pass,
+deployed via `restart_live_maker.sh`, both processes confirmed running
+`half_spread_pct=0.0200`.
+
+**The roadmap** (`next_steps.md` #15, full detail there): a 4-phase plan —
+(A) compose already-built `volatility.py` + `economics.py` into a
+per-cycle computed spread instead of a static CLI default (the one
+genuinely unblocked, ready-to-build item on the whole framework list);
+(B) a read-only cross-venue "sanity band" check against Bisq/Eigen ASB
+data, gated on Phase A's plumbing; (C) replace the still-guessed lock-time
+assumption with real measured data once #4 exists; (D) verify the whole
+chain against real P&L once #3 exists. Planned only — Phase A needs no new
+sign-off to build/test (composing two already-approved modules), but
+deploying any change to what `live_maker.py` quotes with live capital
+still needs review before going live, same as this fix.
+
+## 2026-09-19, later still: Phase A built, tested, and deployed (`next_steps.md` #15)
+
+Went through this file's own session-start checklist first (`../CLAUDE.md`):
+exactly 2 `live_maker` processes, poller current (last cycle logged both
+`bisq:` and `eigen_asb:` lines within the last 5 minutes) — no hang, clean
+to proceed.
+
+Built Phase A of the pricing roadmap above: `economics.py` gained
+`live_annualized_vol_pct()` (extrapolates `VolatilityMonitor`'s rolling-
+window reading to an annualized-vol-equivalent — the inverse of
+`vol_buffer_pct_for_hours`'s existing down-scaling) and
+`dynamic_half_spread_pct()` (the actual `max(operator_floor,
+required_spread_pct(...))` composition). `external_rates.ReferenceRate`
+gained a `usd_price_from` field so the live USD notional can be computed
+from data the cycle already fetched — no new external API call.
+`live_maker.py`'s `--half-spread-pct` is now read as a floor rather than
+the quoted value itself; a new `_dynamic_half_spread_pct` helper computes
+the real per-cycle spread each cycle, using a new `assumed_fill_hours`
+field/`--assumed-fill-hours` flag (default 2.5h — the midpoint of #14's
+own "2-3h realistic fill" estimate) as the vol-buffer horizon, kept
+deliberately separate from `cfg.lock_hours` (the offer's technical HTLC
+ceiling, unchanged at 24h) since Phase A's own spec keeps the fill-time
+input a static guess until Phase C measures it for real.
+
+14 new tests added (98→112 total in `basicswap/strategy/tests/`, all
+passing): economics-level checks that the computed spread never drops
+below the floor, widens under an elevated (~p99) volatility reading,
+stays at the floor under a calm (~p50) one, and falls back to the static
+`ANNUALIZED_CROSS_VOL_PCT` assumption with no live reading yet; plus
+`run_cycle`-level integration tests confirming a real posted offer prices
+wider than the floor under elevated volatility and exactly at the floor
+when the USD cross isn't available that cycle. Full suite reverified
+green after the change (112/112).
+
+**Deployed same session, on Evan's go-ahead.** `restart_live_maker.sh` run:
+both processes stopped and relaunched cleanly (exactly 2 confirmed after),
+both startup logs show `half_spread_floor_pct=0.0200 assumed_fill_hours=2.50`.
+The ask side's very first cycle already exercised the new path end-to-end —
+`dynamic half_spread_pct=0.0217 (floor=0.0200, notional=$650.10, vol_pct=n/a
+over 15m)` — correctly falling back to the static `ANNUALIZED_CROSS_VOL_PCT`
+assumption on a fresh process with no volatility history yet, computing
+just above the floor rather than crashing or defaulting to something
+unsafe. Bid side is in its known "nothing free to offer" state (XMR
+reserved above `--reserve-usd 210`, per the deliberately-deferred
+bid-side-funding decision — not a new issue). Re-verified stable a few
+seconds later: still exactly 2 processes, no errors in either log.
+
+## 2026-09-20: offer-size quantization + opportunistic bid-scanning (`basicswap/next_steps.md` #9)
+
+Evan asked whether BasicSwap's own built-in "AMM" offer-posting bot
+(`scripts/createoffers.py`, its own GUI page — not a liquidity-pool AMM,
+just BasicSwap's own name for a config-templated version of what
+`live_maker.py` already does) had anything worth stealing. Two things did:
+
+1. **Offer-size quantization (`amount_step`) — built, tested, not deployed.**
+   `live_maker.py`'s `--reserve-usd` bid-sizing was offering the *exact*
+   wallet-balance leftover each cycle, which discloses the wallet's precise
+   balance to anyone watching the offer book. `--amount-step` now quantizes
+   that down to a whole multiple, opt-in (default off, matching this
+   project's standing posture that a live-money behavior change needs an
+   explicit restart with the flag, not just code existing). 3 new tests.
+2. **Opportunistic bid-scanning (OBS) — built, tested, verified read-only
+   against live data, not run with `--live`.** New `strategy/bid_scanner.py`
+   actively bids into *other* makers' live offers when priced better than a
+   target rate, rather than only posting our own offer and waiting — see
+   `ARCHITECTURE.md` §5's matching update for how this fits the framework's
+   replenishment-hierarchy design (an active mode alongside the existing
+   passive one, still one venue). Evan's explicit requirement when
+   authorizing this — auditability of OBS's own profitability, independent
+   of the ask/bid maker-offer activity — is met via a new `bid_scan_events`
+   table (kept separate from `live_quote_events` on purpose) plus
+   `reconcile_bid_outcomes()`, which polls each bid's real terminal outcome
+   and closes a gap `live_maker.py`'s own docstring had flagged as never
+   built. 29 new tests; 144/144 passing across `strategy/tests/`. A real
+   dry run against the live node correctly parsed/filtered/sorted 6 of 9
+   real live BTC/XMR offers — a pipeline-correctness check, not a
+   profitability claim (none of today's real offers clear the actual 0.02
+   floor spread, consistent with this project's existing "real spread
+   rarely clears the bar" finding).
+
+**Neither change is deployed.** `amount_step` needs a restart with the flag
+added; OBS needs a first `--live` run, gated on Evan's explicit go-ahead the
+same way every other live-capital escalation in this project has been (the
+first live offer, the first trivial test swap, the volatility kill-switch).
+Full detail in `basicswap/next_steps.md` #9 and `basicswap/project_status.md`'s
+matching 2026-09-20 entries.
+
 ## Handoff for the next session
 
 **Goal of this project**: prove out (then grow) a profitable, eventually
@@ -485,25 +793,59 @@ snapshot"**:
    this directory** — it exists because of a real 2h45m hang found and fixed
    2026-09-18 (see this file's "Bisq poller hang, same day" entry above);
    don't skip it just because the poller *looks* scheduled and fine.
-1. **Check whether `basicswap/restart_live_maker.sh` has been run yet.**
-   `ps aux | grep live_maker` should show exactly 2 processes; check both
-   startup log lines (`~/coinswaps/basicswap_live_maker.log` and
-   `..._bid.log`) for `half_spread_pct=0.0110` specifically, not just that a
-   process exists — `0.0066` in either log means the restart hasn't
-   happened yet and the bid side may still be down. If it hasn't happened,
-   that's the single highest-priority item — the bid side generates zero
-   revenue while down.
-2. **If picking up Eigen ASB (`next_steps.md` #13)**: the WebSocket
-   transport fix is scoped and ready to implement — read that item's full
-   entry before starting, it has the exact failure modes and the specific
-   file (`create_transport()` in `fetch_quotes_json.rs`) that needs the fix.
-   The `eigenwallet-core` clone with both built examples lives in the prior
-   session's scratchpad, not this repo — recreate it if it's gone (cheap,
-   33MB, no submodules needed for this).
-3. **Read `next_steps.md` #11 before building anything resembling a
+1. **`half_spread_pct` is now 0.02, not 0.011** — fixed and deployed
+   2026-09-19 (`next_steps.md` #14), confirmed via both processes'
+   startup logs. Don't re-read the number from any startup log dated
+   before ~19:36 that day, and don't re-derive the justification — it's
+   fully written up in `strategy/live_maker.py`'s own argparse comment and
+   in `next_steps.md` #14. Still worth a quick re-check (`ps aux | grep
+   live_maker`, exactly 2 processes) since it's cheap.
+2. **Eigen ASB (`next_steps.md` #13) is DONE and DEPLOYED, not a pending
+   item** — don't redo the WebSocket-transport work, the wire-level
+   diagnosis, the `libp2p` bump, or the Python integration; all of it is
+   done, tested (29/29), and verified writing real rows into the actual
+   production `~/coinswaps/venue_observations.db` on the existing 5-minute
+   launchd schedule (`com.market_maker.venues-poller`, no new plist). The
+   compiled Rust binary lives permanently at `~/eigenwallet-core/target/
+   release/examples/fetch_quotes_json` (release build, survives reboots) —
+   not scratchpad-scoped any more. The only remaining open thread here is
+   passive: let history accumulate toward the 1–2 week bar before drawing
+   any real profitability conclusion from it. 2 of the first sample's 3
+   price outliers are root-caused precisely (the reference ASB's own quote
+   code zeroing `min_quantity`/`max_quantity` when its unreserved Monero
+   balance can't cover its own configured minimum) — the 3rd is a
+   different case (real tiny tradeable size, persistent ~28% markup), see
+   `next_steps.md` #13's correction — not something to re-derive.
+3. **`next_steps.md` #15 Phase A is BUILT, TESTED, AND DEPLOYED, 2026-09-19**
+   — don't redo `economics.dynamic_half_spread_pct`/`live_annualized_vol_pct`,
+   `external_rates.ReferenceRate.usd_price_from`, or
+   `live_maker._dynamic_half_spread_pct`; all built, 14 new tests
+   (112/112 passing), and both live processes restarted and confirmed
+   running with `half_spread_floor_pct=0.0200 assumed_fill_hours=2.50`,
+   the ask side's first cycle already exercising the dynamic computation
+   for real. `--half-spread-pct` is now a floor, not the quoted value —
+   don't read a startup log's `half_spread_floor_pct` as "the spread it's
+   quoting at," check the per-cycle `dynamic half_spread_pct=...` log
+   lines for that. Phases B–D are still not started, each gated on the one
+   before — read the full phase breakdown in `next_steps.md` before
+   starting any of it.
+4. **Read `next_steps.md` #11 before building anything resembling a
    cross-venue offer scanner** — Evan asked for this idea to be designed and
    logged, explicitly *not* built yet. Don't start implementing it without
-   checking with Evan first.
+   checking with Evan first. Note this is different from #15's Phase B
+   (context for our own price, not acting on another venue's).
+5. **`amount_step` (`basicswap/next_steps.md` #9) and opportunistic
+   bid-scanning (`basicswap/strategy/bid_scanner.py`, same item #9) are both
+   BUILT AND TESTED, 2026-09-20 — neither is deployed/live.** Don't redo the
+   `post_bid`/`get_bid` API research, the `bid_scan_events` schema, or
+   `bid_scanner.py`'s scan/size/bid/reconcile pipeline (144/144 tests passing
+   across `strategy/tests/`) — it's done. What's actually still open: turning
+   `amount_step` on needs `restart_live_maker.sh` with the flag added; OBS
+   needs a first `--live` run. Neither should happen without Evan's explicit
+   go-ahead first (submitting a real bid via OBS is a materially less
+   reversible action than anything `live_maker.py` itself does — see
+   `ARCHITECTURE.md` §5's matching update). Full detail in
+   `basicswap/next_steps.md` #9's "Built 2026-09-20" section.
 
 **What's true right now (verify before trusting, this is a snapshot)**:
 - Volatility kill-switch (#1), duplicate-instance PID guard (#9), and the
@@ -520,11 +862,142 @@ snapshot"**:
   blocked**, per that file's own explicit gating.
 - **#6 (venue #2, live capital) is still blocked** — narrowed 2026-09-18 to
   cover only *putting capital* on a second venue, not *observing* one.
-  **#12 (Bisq)** is built and verified live. **#13 (Eigen ASB)** is built
-  but not yet returning real data — see above.
+  **#12 (Bisq)** and **#13 (Eigen ASB)** are both built, deployed, and
+  accumulating real data on the same 5-minute schedule as of 2026-09-19 —
+  Eigen ASB is now a real data source, same footing as Bisq.
 
 **Do not put real capital on #6 (venue #2) or start #7 (inventory
 controller)** without an explicit human decision first — both are
 deliberately deferred per `next_steps.md` #6/#7's own reasoning. Same rule
 applies to #11. Read-only observation work (#12, #13, or a future venue) is
 *not* subject to this — it's a different, lower-risk ask.
+
+## 2026-09-24: profitability review, fill ledger built, 6.7% incident corrected
+
+**Profitability by venue (as of 2026-09-24)**: BasicSwap is the only venue
+with capital (~$890: 0.00808 BTC + 0.377 XMR). It has 2 completed automated
+fills ever (both 09-18) and **0 fills since `half_spread_pct` went to 0.02 on
+09-19** (~300 ask reposts). Realized round trip about **-$46 plus ~$2–3
+fees**: ~-$6 edge at fill, ~-$40 from holding XMR bought at the top of a
+real ~7% XMR/BTC spike. Bisq and Eigen ASB are observation-only, $0 P&L.
+**There is no evidence yet of a profitable strategy.**
+
+**Cross-venue markups vs. mid (last 5 days, `venue_observations.db`)**:
+- Selling BTC for XMR (our ask side): Bisq median +1.1%, p25 +0.1%. We quote
+  +2.0%, so we're likely priced out.
+- Selling XMR for BTC (our bid side): Bisq median +4.5%, Eigen +2.6%. That
+  side has wider margins, but we don't quote it: the XMR wallet sits below
+  the $210 reserve, and Evan will fund it later.
+
+**Built**: `basicswap/strategy/fill_ledger.py` plus a `fills` table (closes
+`next_steps.md` #3/#4). Details and the 6.7% correction are in
+`basicswap/project_status.md`'s 2026-09-24 entries. 150/150 tests pass.
+Uncommitted as of writing.
+
+## 2026-09-24, later: kill-switch hysteresis built + Bisq trade-flow measured (handoff items 4 and 5)
+
+**Kill-switch (item 4): built and tested, NOT deployed.** Replaying the 09-18
+ask fill against `basicswap_live_maker.log` (EDT) showed the actual failure
+mode. The 15-min switch fired four cycles running (12:04–12:19, up to 3.86%),
+then on **one** calm reading at 12:24 run_cycle repriced to 136.17. That offer
+was filled at 12:30, at the top of the move (+1h markout −7.27%). Only ~3
+samples fit a 15-min window at 5-min cadence. The 12:09:48 sample aged out by
+one second, and CoinGecko's price plateaued at 16:16–16:21 UTC, so what was
+left looked calm. A 7-day recalibration (1,585 samples) also puts the 15-min
+p99 at 2.01%, not the original 0.84%. Added to `volatility.py`/`live_maker.py`:
+a 60-min second window (default 3%, ≈p95) and a 30-min cooldown (once tripped,
+stay paused until 30 min pass with no new trip). New CLI flags:
+`--kill-switch-long-window-minutes`, `--kill-switch-long-volatility-pct`,
+`--kill-switch-cooldown-minutes` (≤0 disables). Defaults only tighten.
+Replaying the week: pauses ~18% of cycles in 24 episodes (today: ~7% in 47
+flickering episodes). Loosening 15-min to 1.2% gives ~9.5% in 10 episodes;
+that's Evan's call. 159/159 `strategy/tests` pass. **Takes effect only after
+`basicswap/restart_live_maker.sh`** (no flag changes needed).
+
+**Bisq demand (item 5): measured.** `venues/bisq/client.py` has a new
+`get_trades()`, and `python -m venues.bisq.trade_flow` is the rerunnable
+analysis. Last 30 days of xmr_btc: **962 trades, ~32/day, ~2.6 BTC/day**,
+median size 0.03 BTC (70% of trades ≥ our 0.008 BTC). Direction, inferred
+from price vs. Kraken hourly VWAP: **94% of trades clear above VWAP
+(median +1.95%), and only 3.7% of BTC volume trades below it.** So Bisq's
+XMR/BTC flow is almost entirely people buying XMR with BTC at a premium.
+Eigen ASB's ~+2.6% XMR-sell quotes point the same way.
+Implications:
+- Our **ask side** (buy XMR below mid) quotes the direction almost nobody
+  trades organically. Both real ask fills came during a fast move (adverse
+  flow), which fits. Lowering the ask markup (handoff item 3's experiment)
+  probably buys fills mostly from informed/adverse flow, not organic demand.
+- The premium sits on the **XMR-sell side** (our bid side). The bid side's
+  funding is deferred by Evan; this is new evidence for that decision, not
+  a nag.
+- Caveat: Bisq flow may not match BasicSwap's own, and the direction is
+  inferred rather than reported.
+
+## 2026-09-25: INCIDENT — bid side sold XMR below market and into the reserve (both loops stopped)
+
+At 06:58 the ask offer was partly filled (0.0015 BTC → 0.2285 XMR, +2% edge).
+That lifted the XMR wallet ~$125 above `--reserve-usd 210`. From 11:10 the bid
+side sold it at **2.0–2.9% below mid**. Two swaps completed (11:26, 11:59,
+~0.225 XMR each), so the same surplus sold twice and the wallet fell to
+0.1558 XMR (~$87). Three more accepted swaps (11:11, 11:16, 11:47) sat
+retrying our XMR lock with "not enough money". Net cost is about -$7, since the
+XMR became ~0.00289 BTC.
+
+Root causes, both fixed in `basicswap/strategy/live_maker.py` (172/172 tests):
+1. **Price direction.** `quoter.half_spread_rate(side="bid")` = mid×(1−h) is
+   right in the shadow quoter's units, but the live bid side flips the pair to
+   xmr→btc (BTC per XMR), so it sold XMR cheap. Now `_offer_rate` = mid×(1+h)
+   for every offer, plus a hard refusal to post at or below mid. The 09-18
+   bid fill (−0.77%) was the same bug.
+2. **In-flight swaps.** The wallet balance doesn't drop until our lock tx
+   publishes, and each reprice posts a new offer (max_concurrent_bids=1 is
+   per offer). `run_cycle` now checks `/json/bids`. While any non-terminal
+   swap is selling coin_from→coin_to, it revokes our live offer in that
+   direction and posts nothing.
+
+Evan stopped both live_maker processes 09-25 (the sandbox blocked me). The 3
+stuck swaps need abandoning in the BasicSwap UI. Neither loop should restart
+until that's done and Evan has reviewed. `bid_scanner.py`'s "below mid" is
+correct for its case (buying from others' offers) and is untouched.
+
+**XMR top-up**: new `strategy/topup_xmr.py`, a one-shot BTC→XMR bid to bring
+the wallet back to $210 (+5% buffer, ≤3% over mid, aborts while any
+Monero→Bitcoin swap is in flight). A session-only Claude cron runs it at 18:57
+on 09-25 if the session is still open. **Ran and completed**: bid
+`000000006ab6fc4b…` bought 0.23267 XMR for ~0.00157 BTC at +2.19% over mid
+(placed 18:57, completed 20:31; the seller's XMR lock took ~45 min after
+ours confirmed). The wallet is now ~0.3885 XMR (~$216). The 3 stuck swaps
+were abandoned at Evan's request (all `Abandoned`), and both live loops
+are still stopped.
+
+## Handoff for the next session (2026-09-24, supersedes earlier handoffs)
+
+1. **BasicSwap rate poller is DOWN** (last write 2026-09-23 09:34, not under
+   launchd). Ask Evan to allow launchd changes (the sandbox blocked the
+   install as persistence), then add
+   `com.market_maker.basicswap-poller` (`python3 -m strategy.poller`, 300s) and
+   `com.market_maker.fill-ledger` (`python3 -m strategy.fill_ledger`, 3600s),
+   cloned from `venues/com.market_maker.venues-poller.plist` with
+   WorkingDirectory `basicswap/`. Until then, check `ps` for a
+   hand-started `run_poller.sh --loop`.
+2. **Commit** the 09-24 work if Evan hasn't: `fill_ledger.py`,
+   `run_fill_ledger.sh`, `tests/test_fill_ledger.py`, `storage.py`,
+   `api_client.py`, and the doc edits.
+3. **The core open question is whether there's a price where we get fills
+   AND make money.** The cost model says ≥2% one-sided is needed, but at
+   2% we get no fills. The next step is a markup experiment (for example 2.0 →
+   1.5 → 1.0% for a fixed number of days each, logging fill rate and markouts
+   via `fill_ledger`). **Needs Evan's sign-off** because it changes live
+   pricing.
+4. **Kill-switch recalibration: BUILT 2026-09-24 (60-min/3% window + 30-min
+   cooldown), not deployed.** Needs Evan to run `basicswap/restart_live_maker.sh`,
+   then confirm the startup log shows `kill_switch_cooldown_minutes=30.0`.
+   See the "later" entry above.
+5. **Measure demand: DONE 2026-09-24.** Bisq xmr_btc runs ~2.6 BTC/day, and
+   ~96% of volume pays a premium to XMR sellers. This reframes item 3: the
+   markup experiment on the ask side is probably the wrong lever. Rerun with
+   `python -m venues.bisq.trade_flow`.
+6. **Define a success bar with Evan** (for example, positive +24h markout net
+   of fees over ≥30 fills) so "is it profitable" has a yes/no answer.
+7. Unblocked but lower priority: #5 tax lots (built on the `fills` table).
+   XMR funding and bid-side reserve are deferred by Evan, so don't re-flag them.

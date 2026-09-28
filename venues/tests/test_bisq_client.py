@@ -58,5 +58,44 @@ class TestBisqMarketsClient(unittest.TestCase):
                 client.get_offers("xmr_btc")
 
 
+class TestBisqGetTrades(unittest.TestCase):
+    def test_get_trades_returns_list_and_passes_params(self):
+        payload = [{"price": "0.0068", "amount": "1.0", "volume": "0.0068",
+                    "payment_method": "BLOCK_CHAINS", "trade_date": 1790275792210}]
+        with mock.patch("urllib.request.urlopen", return_value=_fake_response(payload)) as m:
+            result = BisqMarketsClient().get_trades("xmr_btc", since_ts=1790000000.5, limit=50)
+        self.assertEqual(result, payload)
+        url = m.call_args[0][0].full_url
+        self.assertIn("/api/trades?", url)
+        self.assertIn("market=xmr_btc", url)
+        self.assertIn("timestamp_from=1790000000", url)
+        self.assertIn("limit=50", url)
+
+    def test_get_trades_rejects_non_list(self):
+        with mock.patch("urllib.request.urlopen", return_value=_fake_response({"oops": 1})):
+            with self.assertRaises(BisqMarketsAPIError):
+                BisqMarketsClient().get_trades("xmr_btc", since_ts=0)
+
+
+class TestTradeFlowSummary(unittest.TestCase):
+    def test_premium_and_below_vwap_shares(self):
+        import time as _time
+
+        from ..bisq.trade_flow import summarize
+
+        now = _time.time()
+        hour = int(now // 3600 * 3600)
+        trades = [
+            {"price": "0.0102", "volume": "0.3", "trade_date": now * 1000},  # +2% premium
+            {"price": "0.0099", "volume": "0.1", "trade_date": now * 1000},  # -1%
+            {"price": "0.0100", "volume": "0.1", "trade_date": (now - 40 * 86400) * 1000},  # outside window
+        ]
+        out = summarize(trades, {hour: 0.01}, days=30)
+        self.assertEqual(out["trades"], 2)
+        self.assertEqual(out["matched_to_kraken"], 2)
+        self.assertAlmostEqual(out["share_trades_below_vwap"], 0.5)
+        self.assertAlmostEqual(out["share_btc_volume_below_vwap"], 0.25)
+
+
 if __name__ == "__main__":
     unittest.main()

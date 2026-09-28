@@ -1,8 +1,10 @@
 """Cross-venue observation poller — read-only, places no offer, moves no funds,
 holds no key material anywhere. First venue: Bisq, via its own hosted public
-API (no node/daemon/wallet required — see `bisq/client.py`). Registry-based so a
-second `OfferBookReader` implementation (Eigen ASB, Haveno — `ARCHITECTURE.md`
-§7) is a new entry here, not a rewrite.
+API (no node/daemon/wallet required — see `bisq/client.py`). Second venue,
+added 2026-09-19: Eigen ASB, via a compiled Rust libp2p client rather than an
+HTTP API — see `eigen_asb/client.py`. Registry-based so a third
+`OfferBookReader` implementation (Haveno — `ARCHITECTURE.md` §7) is a new
+entry here, not a rewrite.
 
 Run from `market_maker/` (this package's parent), same convention as
 `basicswap/strategy/poller.py`:
@@ -19,12 +21,14 @@ import time
 from . import storage
 from .bisq.reader import BisqOfferBookReader
 from .config import Config, load_config
+from .eigen_asb.reader import EigenAsbOfferBookReader
 from .offer_book import OfferBookReader
 
 log = logging.getLogger("market_maker.venues.poller")
 
 _READERS: dict[str, type[OfferBookReader]] = {
     "bisq": BisqOfferBookReader,
+    "eigen_asb": EigenAsbOfferBookReader,
 }
 
 

@@ -48,6 +48,9 @@ class TestGetReferenceRate(unittest.TestCase):
         self.assertIsNotNone(rate.kraken_error)
         self.assertIsNone(rate.coingecko_error)
         self.assertAlmostEqual(rate.mid, 30.0 / 60000.0)
+        # market_maker/next_steps.md #15 Phase A: exposed so live_maker.py can
+        # compute a live USD notional without a second external call.
+        self.assertAlmostEqual(rate.usd_price_from, 30.0)
 
     def test_xmr_btc_uses_both_sources_and_computes_disagreement(self):
         with mock.patch.object(
@@ -89,6 +92,9 @@ class TestGetReferenceRate(unittest.TestCase):
         self.assertIsNotNone(rate.coingecko_error)
         self.assertAlmostEqual(rate.kraken_rate, 0.0025)
         self.assertAlmostEqual(rate.mid, 0.0025)
+        # usd_price_from is a CoinGecko-cross byproduct — None even though a
+        # Kraken fallback rate exists, since Kraken never gives a USD price.
+        self.assertIsNone(rate.usd_price_from)
 
     def test_both_sources_fail_raises(self):
         with mock.patch.object(

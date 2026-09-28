@@ -113,6 +113,68 @@ CREATE TABLE IF NOT EXISTS live_quote_events (
 
 CREATE INDEX IF NOT EXISTS idx_live_quote_events_pair_side_time
     ON live_quote_events (coin_from, coin_to, side, created_at);
+
+-- Opportunistic bid-scanning (next_steps.md #9, built 2026-09-20 at Evan's
+-- explicit go-ahead) — bid_scanner.py bidding into OTHER makers' live
+-- offers, a fundamentally different activity from live_quote_events above
+-- (which only ever records OUR OWN posted offers). Kept in its own table,
+-- not folded into live_quote_events, specifically so this activity's own
+-- profitability can be audited independently of the ask/bid maker-offer
+-- strategy (Evan's explicit requirement when authorizing this feature) —
+-- joining the two tables together would conflate two different trading
+-- activities into one number. reference_mid is the EXTERNAL rate at
+-- decision time (external_rates.py, not anything from BasicSwap's own
+-- offer book), so edge_pct measures what a bid captured against an
+-- independent price source, not against our own quoting.
+CREATE TABLE IF NOT EXISTS bid_scan_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at REAL NOT NULL,
+    offer_coin_from TEXT NOT NULL,  -- what the OFFER sells (what we're buying)
+    offer_coin_to TEXT NOT NULL,    -- what the OFFER wants (what we're paying)
+    offer_id TEXT NOT NULL,
+    bid_id TEXT NOT NULL,
+    offer_rate REAL NOT NULL,       -- offer_coin_to per offer_coin_from, taken exactly (never negotiated)
+    reference_mid REAL NOT NULL,
+    edge_pct REAL NOT NULL,         -- how much better than reference_mid this bid bought at
+    amount_from REAL NOT NULL,      -- amount of offer_coin_from bid for
+    amount_to REAL NOT NULL,        -- implied amount of offer_coin_to paid (amount_from * offer_rate)
+    usd_notional REAL,
+    offer_created_at INTEGER,
+    offer_expire_at INTEGER,
+    bid_state TEXT,                 -- last known BidStates display string from get_bid(), via reconcile_bid_outcomes()
+    resolved INTEGER NOT NULL DEFAULT 0,  -- 0 = still in progress, 1 = reached a terminal state
+    outcome TEXT,                   -- 'success' | 'failure' | NULL while unresolved
+    resolved_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_bid_scan_events_pair_time
+    ON bid_scan_events (offer_coin_from, offer_coin_to, created_at);
+CREATE INDEX IF NOT EXISTS idx_bid_scan_events_resolved
+    ON bid_scan_events (resolved);
+
+-- Per-fill P&L ledger (market_maker/next_steps.md #3/#4): one row per bid
+-- that landed on an offer live_maker.py posted, whatever its outcome.
+-- edge/markout columns: signed % of amount_to vs. fair value of amount_from
+-- at reference mid (at fill, +1h, +24h); gross of network fees. See
+-- fill_ledger.py.
+CREATE TABLE IF NOT EXISTS fills (
+    bid_id TEXT PRIMARY KEY,
+    offer_id TEXT NOT NULL,
+    venue TEXT NOT NULL,
+    side TEXT NOT NULL,
+    coin_from TEXT NOT NULL,        -- what we gave
+    coin_to TEXT NOT NULL,          -- what we received
+    amount_from REAL NOT NULL,
+    amount_to REAL NOT NULL,
+    rate REAL NOT NULL,
+    bid_state TEXT NOT NULL,
+    bid_created_at REAL NOT NULL,
+    reference_mid_at_fill REAL,     -- coin_to per coin_from
+    edge_pct_at_fill REAL,
+    markout_1h_pct REAL,
+    markout_24h_pct REAL,
+    synced_at REAL NOT NULL
+);
 """
 
 
@@ -384,6 +446,91 @@ def fetch_live_quote_events(
     return conn.execute(query, params).fetchall()
 
 
+def insert_bid_scan_event(
+    conn: sqlite3.Connection,
+    offer_coin_from: str,
+    offer_coin_to: str,
+    offer_id: str,
+    bid_id: str,
+    offer_rate: float,
+    reference_mid: float,
+    edge_pct: float,
+    amount_from: float,
+    amount_to: float,
+    usd_notional: float | None = None,
+    offer_created_at: int | None = None,
+    offer_expire_at: int | None = None,
+    created_at: float | None = None,
+) -> int:
+    created_at = created_at if created_at is not None else time.time()
+    cur = conn.execute(
+        """
+        INSERT INTO bid_scan_events (
+            created_at, offer_coin_from, offer_coin_to, offer_id, bid_id,
+            offer_rate, reference_mid, edge_pct, amount_from, amount_to,
+            usd_notional, offer_created_at, offer_expire_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            created_at, offer_coin_from, offer_coin_to, offer_id, bid_id,
+            offer_rate, reference_mid, edge_pct, amount_from, amount_to,
+            usd_notional, offer_created_at, offer_expire_at,
+        ),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def fetch_bid_scan_events(
+    conn: sqlite3.Connection,
+    offer_coin_from: str | None = None,
+    offer_coin_to: str | None = None,
+    resolved: bool | None = None,
+    since: float | None = None,
+) -> list[sqlite3.Row]:
+    conn.row_factory = sqlite3.Row
+    query = "SELECT * FROM bid_scan_events WHERE 1=1"
+    params: list[Any] = []
+    if offer_coin_from is not None:
+        query += " AND offer_coin_from = ?"
+        params.append(offer_coin_from)
+    if offer_coin_to is not None:
+        query += " AND offer_coin_to = ?"
+        params.append(offer_coin_to)
+    if resolved is not None:
+        query += " AND resolved = ?"
+        params.append(int(resolved))
+    if since is not None:
+        query += " AND created_at >= ?"
+        params.append(since)
+    query += " ORDER BY created_at ASC"
+    return conn.execute(query, params).fetchall()
+
+
+def update_bid_scan_event_outcome(
+    conn: sqlite3.Connection,
+    bid_id: str,
+    bid_state: str,
+    resolved: bool,
+    outcome: str | None,
+    resolved_at: float | None = None,
+) -> None:
+    """Called by bid_scanner.reconcile_bid_outcomes() after polling
+    api_client.get_bid() for this bid's real current state — always updates
+    bid_state (even while unresolved, so the latest known state is visible
+    without waiting for a terminal one), and only sets resolved/outcome/
+    resolved_at once BidStates has actually reached a terminal value."""
+    conn.execute(
+        """
+        UPDATE bid_scan_events
+        SET bid_state = ?, resolved = ?, outcome = ?, resolved_at = ?
+        WHERE bid_id = ?
+        """,
+        (bid_state, int(resolved), outcome, resolved_at, bid_id),
+    )
+    conn.commit()
+
+
 def fetch_offer_snapshots(
     conn: sqlite3.Connection,
     coin_from: str,
@@ -414,3 +561,33 @@ def fetch_rate_snapshots(
         params.append(since)
     query += " ORDER BY polled_at ASC"
     return conn.execute(query, params).fetchall()
+
+
+_FILL_COLUMNS = (
+    "bid_id", "offer_id", "venue", "side", "coin_from", "coin_to", "amount_from",
+    "amount_to", "rate", "bid_state", "bid_created_at", "reference_mid_at_fill",
+    "edge_pct_at_fill", "markout_1h_pct", "markout_24h_pct", "synced_at",
+)
+
+
+def upsert_fill(conn: sqlite3.Connection, **row: Any) -> None:
+    """Insert or refresh one fills row. A NULL markout never overwrites an
+    already-computed one (the reference data it came from may have aged out
+    of a later sync's reach, but the number stays true)."""
+    cols = ", ".join(_FILL_COLUMNS)
+    marks = ", ".join("?" for _ in _FILL_COLUMNS)
+    keep = ("reference_mid_at_fill", "edge_pct_at_fill", "markout_1h_pct", "markout_24h_pct")
+    updates = ", ".join(
+        f"{c} = COALESCE(excluded.{c}, fills.{c})" if c in keep else f"{c} = excluded.{c}"
+        for c in _FILL_COLUMNS if c != "bid_id"
+    )
+    conn.execute(
+        f"INSERT INTO fills ({cols}) VALUES ({marks}) ON CONFLICT(bid_id) DO UPDATE SET {updates}",
+        [row[c] for c in _FILL_COLUMNS],
+    )
+    conn.commit()
+
+
+def fetch_fills(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    conn.row_factory = sqlite3.Row
+    return conn.execute("SELECT * FROM fills ORDER BY bid_created_at ASC").fetchall()

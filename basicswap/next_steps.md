@@ -640,3 +640,142 @@ Claude session, not a machine restart.
    requires clearing all of that, plus Evan's explicit sign-off per
    `ARCHITECTURE.md` §6 — nothing above authorizes posting a real automated
    offer or moving more capital than this one trivial test swap.
+
+## 9. Opportunistic bid-scanning — scoped 2026-09-20, built same day, NOT yet run with --live
+
+Evan asked (2026-09-20) whether BasicSwap's own built-in "AMM" offer-posting bot
+(`~/coinswaps/basicswap/scripts/createoffers.py`, reachable from its GUI's AMM
+page) had anything worth stealing for our own `strategy/live_maker.py`. It's not
+a pooled-liquidity AMM (no reserves, no x*y=k) — it's BasicSwap's own name for a
+config-templated version of exactly what `live_maker.py` already does: post/
+reprice/revoke offers off a reference rate. Two things it does that our strategy
+didn't were identified as worth taking:
+
+1. **Offer-size quantization (`amount_step`) — built and deployed same session,
+   see `project_status.md`'s 2026-09-20 entry.** Low-risk: it only changes what
+   number `live_maker.py` computes locally before posting our *own* offer, no
+   new execution surface, opt-in via `--amount-step` (default off, current live
+   behavior unchanged until Evan passes the flag on a restart).
+2. **Opportunistic bid-scanning — this section, scoped only, not built.**
+   `createoffers.py`'s `filter_biddable_offers`/`should_bid_on_offer`/
+   `execute_bid_plan` (scripts/createoffers.py:622-729ish) actively scan the
+   *public* offer book for offers priced better than our own target rate and
+   submit a real bid against them — i.e. it doesn't just wait to be filled, it
+   goes and fills other makers' offers when the price is right. This is a
+   genuinely different capability from anything `live_maker.py` has: today we
+   only ever post our own offer and wait (`decide_and_act`'s whole job is
+   managing our own quote, never anyone else's).
+
+**Why this wasn't wired in live today, unlike item 1:** this is a materially
+bigger risk surface than offer-size quantization —
+- It's a **new write path**: `strategy/api_client.py` has `get_offers` (read)
+  but no bid-placement method at all yet (checked — `post_offer`/`revoke_offer`
+  are the only writes that exist). A real `post_bid` (or whatever BasicSwap's
+  API calls it) would need the same care `post_offer`/`revoke_offer` got —
+  confirmed request/response shape against the real node, error handling,
+  idempotency — before anything executes with real BTC/XMR.
+  - **Confirmed 2026-09-17 in §3's fill-tracking finding**: BasicSwap's real
+    trivial test swap (bid into a live XMR-sell offer) took 42m30s end-to-end
+    and tied up capital for that whole window — a bid-scanning loop is
+    committing real capital to a real HTLC lock the moment it bids, not a
+    reversible/cancelable action the way posting-then-revoking our own offer
+    is. Every safety property `live_maker.py`'s docstring already leans on
+    (revoke-before-post ordering, `_check_funded` before any action,
+    `InsufficientBalanceError` handled as expected-not-exceptional) exists
+    specifically because posting/revoking OUR OWN offer is cheap and
+    reversible (§8: "a pure off-chain SMSG message broadcast, no on-chain tx,
+    no fee"). Bidding into someone else's offer is not that — it's the thing
+    that actually starts an atomic swap.
+  - **Griefing/counterparty-risk exposure is asymmetric here vs. posting our
+    own offer.** §4's griefing research covers what happens when *someone else*
+    bids into *our* offer (BasicSwap's own `shouldAutoAcceptBid` defenses
+    apply). Nothing has been researched about what protects *us* if we're the
+    one bidding into a stale, mispriced, or bad-faith offer — e.g. does the
+    counterparty have to auto-accept, can they just never respond and tie up
+    our capital for the lock window at zero cost to them, is there a rate-
+    validation step on our own bid before it's submitted. This needs its own
+    read of `basicswap.py`'s bid-submission path before writing any code, the
+    same way §5 read the auto-accept path before trusting it.
+  - This project's every prior escalation into new real-money territory (the
+    first live offer 2026-09-17, the volatility kill-switch, raising
+    `half_spread_pct`, the very first trivial test swap) went through Evan's
+    explicit go-ahead first, not "built quietly, ask forgiveness later" — no
+    reason for a new execution pathway to be the exception, especially one
+    that commits capital to counterparties we don't control the terms of.
+
+**What "building this" would actually look like, when authorized:** a new
+`strategy.api_client.BasicSwapClient` write method for bid submission (mirrors
+`post_offer`'s existing shape/error-wrapping); a scanning function parallel to
+`_find_own_live_offer` that reads `get_offers()` and filters to the *other*
+side's offers priced better than `half_spread_rate(reference_mid, ...)` (reusing
+`quoter.py`'s existing rate math, just evaluated against someone else's posted
+rate instead of ours); a decision function analogous to `decide_and_act` but for
+"should we bid this" (own funding check via `_check_funded`'s existing pattern,
+a sanity/staleness check on the target offer's own `created_at`/`expire_at`, and
+explicitly no interaction with `rate_negotiable` per §8's already-documented
+danger there); full test coverage mirroring `test_live_maker.py`'s
+`DecideAndActTests` conventions; and a first live run at trivial size, the same
+staged-rollout posture every other capability here has followed.
+
+**Built 2026-09-20, at Evan's explicit "go ahead and build" follow-up (with one
+explicit added requirement: auditability of OBS's own profitability,
+independent of live_maker.py's ask/bid maker-offer activity).** Matches the
+scoping above closely:
+
+- `api_client.py`: `post_bid()` (`POST /json/bids/new`, mirrors `post_offer`'s
+  shape exactly) and `get_bid()` (`POST /json/bids/<id>`, read-only — the only
+  way to learn a bid's real outcome after submission).
+- `storage.py`: a new `bid_scan_events` table, deliberately **separate** from
+  `live_quote_events` — every field needed to audit OBS on its own (the
+  external `reference_mid` at decision time, the offer's own posted rate,
+  `edge_pct` computed against that independent price, amounts, and a
+  `resolved`/`outcome` pair updated only once a bid reaches a real terminal
+  state).
+- New `strategy/bid_scanner.py`: `scan_candidates()` (reads `get_offers()`,
+  filters out our own/expired/revoked/already-bid/about-to-expire offers,
+  keeps only rates at or better than a target computed via
+  `quoter.half_spread_rate(reference_mid, half_spread_pct, "bid")`, sorted
+  cheapest-first) → `_size_bid()` (bounded by the offer's own amount/
+  min_bid_amount, our own per-bid cap, and a per-cycle exposure budget) →
+  `run_cycle()` (same guard ordering as `live_maker.py`: source-disagreement
+  gate, then the volatility kill-switch, then a real wallet-balance check
+  immediately before each bid — reuses `economics.dynamic_half_spread_pct`
+  for the same volatility-scaled floor `live_maker.py`'s own dynamic spread
+  uses, rather than re-deriving it). `reconcile_bid_outcomes()` polls
+  `get_bid()` for every still-unresolved row and records its real BidStates
+  outcome (`Completed` → success; `Timed-out`/`Abandoned`/`Error`/`Rejected`/
+  `Expired`/any `Failed*` variant → failure; everything else left
+  unresolved) — this is the audit mechanism Evan's requirement above maps to
+  directly, and closes the exact gap `live_maker.py`'s own docstring had
+  flagged as "not built here."
+- `--live` gates real submission exactly like `live_maker.py` — without it,
+  `run_cycle` still scans and logs what it WOULD bid, but never calls
+  `post_bid` and never writes to `bid_scan_events` (dry-run is a real mode
+  here, not a separate module, unlike `live_maker.py`/`quoter.py`'s split —
+  there's no live offer state to reconcile against in scan-only mode, just a
+  read-only comparison). A `--reconcile-only` mode updates existing bids'
+  outcomes without scanning. `run_bid_scanner.sh` mirrors
+  `run_live_maker.sh`'s duplicate-instance lock-file guard (keyed on the
+  pair, not a "side").
+- 29 new tests (6 in `test_api_client.py`, 23 in the new
+  `test_bid_scanner.py`) — 144/144 passing across `strategy/tests/`.
+- **Verified against the live node, read-only**: a real dry run
+  (`--coin-from btc --coin-to xmr --max-bid-amount 0.001 --max-cycle-exposure
+  0.001`, no `--live`) ran clean against the real API with no errors; a
+  direct `scan_candidates()` call against real data correctly parsed, filtered,
+  and cheapest-first-sorted 6 of 9 real live BTC/XMR offers (rates
+  148.0–152.1). At the actual default `half_spread_pct=0.02` floor
+  (target ≈147.0 against a ~150 mid that session), zero of today's real
+  offers clear it — consistent with, not contradicted by, this project's
+  existing finding that the observed market spread rarely clears the
+  required bar (see "What 'yes' actually requires" below); this was a
+  pipeline-correctness check, not a claim that OBS would be profitable today.
+- **Not run with `--live` this session, and no launchd/nohup scheduling set
+  up** — submitting a real bid commits real capital to a real HTLC the moment
+  it happens (the risk asymmetry vs. `live_maker.py`'s own posting/revoking
+  this section already laid out above still applies in full; building the
+  code doesn't change that). A first live run at trivial size, on Evan's
+  explicit go-ahead, is the natural next step — same staged-rollout posture
+  as every other live-capital escalation in this project (the very first live
+  offer 2026-09-17, the first trivial test swap 2026-09-17, the volatility
+  kill-switch 2026-09-18).

@@ -112,6 +112,26 @@ That means: **zero replenishment-provider risk exists today**, and also **zero
 replenishment redundancy** — a real asymmetry worth tracking, not silently
 inheriting the PDF's assumption that a fallback route is already there.
 
+**Partial change, 2026-09-20 — an active alternative now exists in code, not
+yet in production.** `basicswap/strategy/bid_scanner.py` (opportunistic
+bid-scanning, `basicswap/next_steps.md` #9) is a genuinely different
+replenishment mode from anything above: instead of only waiting for a
+counterparty to fill our own resting offer, it actively bids into *other*
+makers' live offers when priced better than a target rate — closer in spirit
+to the PDF's "instant/fee-bearing aggregator" fallback than to "passive
+resting bid" (no protocol fee on BasicSwap itself, but it commits capital and
+starts a real swap immediately on submission, same lack of a resting/
+cancelable state an aggregator fallback would have). This doesn't add a new
+*venue* (still BasicSwap only) or close the "zero replenishment redundancy"
+finding above (Trocador/aggregators remain unevaluated, per §7's table) — it
+adds a second *mode of replenishment on the one venue that exists*: passive
+(post and wait) vs. active (scan and take). Built, unit-tested (144/144 in
+`strategy/tests/`), and verified read-only against real live offers; **not
+run with `--live`** — see `basicswap/next_steps.md` #9 and
+`basicswap/project_status.md`'s 2026-09-20 entry for the full build and the
+reason it wasn't taken live in the same session (submitting a real bid is a
+materially less reversible action than posting/revoking our own offer).
+
 ## 6. Risk controls named in the PDFs, and their status here
 
 | Control | PDF intent | Status in `market_maker/basicswap/` |

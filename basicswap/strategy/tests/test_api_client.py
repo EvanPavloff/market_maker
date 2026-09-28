@@ -148,6 +148,39 @@ class BasicSwapClientTests(unittest.TestCase):
         with self.assertRaises(BasicSwapAPIError):
             self.client.revoke_offer("deadbeef")
 
+    @patch("strategy.api_client.urllib.request.urlopen")
+    def test_post_bid_sends_expected_payload_and_returns_id(self, mock_urlopen):
+        mock_urlopen.return_value = _fake_response({"bid_id": "cafebabe"})
+        bid_id = self.client.post_bid("deadbeef", "0.00500000", "150.99000000")
+        self.assertEqual(bid_id, "cafebabe")
+
+        sent_req = mock_urlopen.call_args[0][0]
+        self.assertEqual(sent_req.full_url, "http://localhost:12701/json/bids/new")
+        payload = json.loads(sent_req.data)
+        self.assertEqual(payload["offer_id"], "deadbeef")
+        self.assertEqual(payload["amount_from"], "0.00500000")
+        self.assertEqual(payload["bid_rate"], "150.99000000")
+
+    @patch("strategy.api_client.urllib.request.urlopen")
+    def test_post_bid_rejects_unexpected_response_shape(self, mock_urlopen):
+        mock_urlopen.return_value = _fake_response({"unexpected": "shape"})
+        with self.assertRaises(BasicSwapAPIError):
+            self.client.post_bid("deadbeef", "0.005", "150.0")
+
+    @patch("strategy.api_client.urllib.request.urlopen")
+    def test_get_bid_returns_detail_dict(self, mock_urlopen):
+        mock_urlopen.return_value = _fake_response({"bid_id": "cafebabe", "bid_state": "Completed"})
+        detail = self.client.get_bid("cafebabe")
+        self.assertEqual(detail["bid_state"], "Completed")
+        sent_req = mock_urlopen.call_args[0][0]
+        self.assertEqual(sent_req.full_url, "http://localhost:12701/json/bids/cafebabe")
+
+    @patch("strategy.api_client.urllib.request.urlopen")
+    def test_get_bid_rejects_response_missing_bid_state(self, mock_urlopen):
+        mock_urlopen.return_value = _fake_response({"bid_id": "cafebabe"})
+        with self.assertRaises(BasicSwapAPIError):
+            self.client.get_bid("cafebabe")
+
 
 if __name__ == "__main__":
     unittest.main()

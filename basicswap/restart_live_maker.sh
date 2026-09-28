@@ -1,7 +1,9 @@
 #!/bin/bash
 # One-shot restart for both live_maker loops (ask: btc->xmr, bid: xmr->btc) —
 # picks up whatever's currently in strategy/api_client.py + strategy/live_maker.py
-# (2026-09-19: the get_wallet_balance KeyError fix + half_spread_pct 0.0066->0.011).
+# (2026-09-19: the get_wallet_balance KeyError fix + half_spread_pct
+# 0.0066->0.011->0.02, the last bump per next_steps.md #14's cost-model +
+# cross-venue analysis).
 #
 # Usage: ./restart_live_maker.sh
 #
@@ -67,7 +69,7 @@ echo "-- processes (expect exactly 2) --"
 ps aux | grep live_maker | grep -v grep
 
 echo
-echo "-- startup log lines (confirm half_spread_pct=0.0110, not 0.0066) --"
+echo "-- startup log lines (confirm half_spread_pct=0.0200, not an older value) --"
 tail -3 "$SWAP_DATADIR/basicswap_live_maker.log"
 echo "---"
 tail -3 "$SWAP_DATADIR/basicswap_live_maker_bid.log"

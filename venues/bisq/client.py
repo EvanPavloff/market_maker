@@ -51,16 +51,36 @@ class BisqMarketsClient:
         that key so callers always get the same flat shape regardless.
         """
         url = f"{self.base_url}/api/offers?" + urllib.parse.urlencode({"market": market})
-        req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout_seconds, context=_SSL_CONTEXT) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
-            raise BisqMarketsAPIError(f"GET {url} failed: {e}") from e
-        except json.JSONDecodeError as e:
-            raise BisqMarketsAPIError(f"GET {url} returned invalid JSON: {e}") from e
+        data = self._get_json(url)
         if isinstance(data, dict) and market in data:
             data = data[market]
         if not isinstance(data, dict) or "buys" not in data or "sells" not in data:
             raise BisqMarketsAPIError(f"GET {url} returned unexpected shape: {data!r}")
         return data
+
+    def get_trades(self, market: str, since_ts: float, limit: int = 2000) -> list[dict[str, Any]]:
+        """Completed trades for one market since `since_ts` (unix seconds),
+        newest first, verbatim — verified live 2026-09-24 against xmr_btc: each
+        row is `{"price", "amount", "volume", "payment_method", "trade_date"}`,
+        with price quote-per-base, amount in base units, volume in quote units
+        (same convention as offers) and trade_date in unix *milliseconds*. No
+        direction field — which side paid is only inferable from price vs. an
+        external mid (see `bisq/trade_flow.py`). The server caps a single
+        response at `limit` rows (2000 covered ~70 days of xmr_btc)."""
+        url = f"{self.base_url}/api/trades?" + urllib.parse.urlencode(
+            {"market": market, "timestamp_from": int(since_ts), "limit": limit}
+        )
+        data = self._get_json(url)
+        if not isinstance(data, list):
+            raise BisqMarketsAPIError(f"GET {url} returned unexpected shape: {data!r}")
+        return data
+
+    def _get_json(self, url: str) -> Any:
+        req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout_seconds, context=_SSL_CONTEXT) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
+            raise BisqMarketsAPIError(f"GET {url} failed: {e}") from e
+        except json.JSONDecodeError as e:
+            raise BisqMarketsAPIError(f"GET {url} returned invalid JSON: {e}") from e

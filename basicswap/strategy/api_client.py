@@ -33,6 +33,23 @@ automation_strat_id unset entirely means NO automation link gets created at all
 (postNewOfferFromParsed only wires one up if a strategy id was explicitly given —
 there's no separate auto_accept_bids form flag), i.e. bids would need manual
 acceptance — pass automation_strat_id=None deliberately if that's what's wanted.
+
+Bid-side write routes (opportunistic bid-scanning, next_steps.md #9, added
+2026-09-20 at Evan's explicit go-ahead) — bidding into OTHER makers' offers,
+not posting our own:
+  - POST /json/bids/new — post_bid(). Field names read directly from
+    js_server.py's js_bids "new" branch: offer_id/amount_from/bid_rate, same
+    decimal-string-not-float convention as post_offer(). amount_from here is
+    in the OFFER's own coin_from units (how much of what the maker is selling
+    we want to buy), not our own paying currency — matches
+    place_bid_on_offer()'s payload in BasicSwap's own createoffers.py.
+  - POST /json/bids/<bid_id> (empty body) — get_bid(). Read-only, but a write-
+    adjacent route: the only way to learn a bid's real BidStates outcome
+    (Completed vs. Abandoned/Failed/Timed-out/etc, describeBid()'s
+    "bid_state" field) after post_bid() submits it — used by
+    bid_scanner.reconcile_bid_outcomes() to audit whether a submitted bid
+    actually turned into a completed swap, independent of anything in
+    live_maker.py's own offer-side event log.
 """
 
 import base64
@@ -218,6 +235,51 @@ class BasicSwapClient:
             url, data=body, method="POST", headers={"Content-Type": "application/json"}
         )
         self._request(req, url)
+
+    def post_bid(self, offer_id: str, amount_from: str, bid_rate: str) -> str:
+        """Submits a real bid into someone ELSE's live offer, at exactly their
+        posted rate (bid_rate is passed through unchanged, never negotiated —
+        see next_steps.md §8's rate_negotiable danger note, same posture as
+        post_offer()'s automation_strat_id choice). amount_from is in the
+        OFFER's own coin_from units (how much of what they're selling we want),
+        not our own paying currency — the server computes what we owe in the
+        offer's coin_to from amount_from * bid_rate.
+
+        This is NOT reversible the way post_offer()/revoke_offer() are (see
+        this module's docstring and bid_scanner.py's own docstring) — it
+        actually starts a real atomic swap and commits capital for the swap's
+        full duration. Returns the new bid's id (hex string).
+        """
+        payload: dict[str, Any] = {
+            "offer_id": offer_id,
+            "amount_from": amount_from,
+            "bid_rate": bid_rate,
+        }
+        rv = self._post("/json/bids/new", payload)
+        if not isinstance(rv, dict) or "bid_id" not in rv:
+            raise BasicSwapAPIError(f"unexpected response from /json/bids/new: {rv!r}")
+        return rv["bid_id"]
+
+    def get_bids(self) -> list[dict]:
+        """Read-only list of every bid BasicSwap knows about (sent and
+        received), each with bid_id/offer_id/bid_state/amounts/created_at.
+        Used by fill_ledger.py to tell fills from expiries."""
+        rv = self._get("/json/bids", {})
+        if not isinstance(rv, list):
+            raise BasicSwapAPIError(f"unexpected response from /json/bids: {rv!r}")
+        return rv
+
+    def get_bid(self, bid_id: str) -> dict:
+        """Read-only detail for one bid (ours or received), keyed by hex id —
+        includes 'bid_state' (a BidStates value as a display string, e.g.
+        "Completed"/"Abandoned"/"Sent") via describeBid(). Used by
+        bid_scanner.reconcile_bid_outcomes() to learn what actually happened
+        to a bid post_bid() submitted, since post_bid()'s own response only
+        confirms submission, not outcome."""
+        rv = self._post(f"/json/bids/{bid_id}", {})
+        if not isinstance(rv, dict) or "bid_state" not in rv:
+            raise BasicSwapAPIError(f"unexpected response from /json/bids/{bid_id}: {rv!r}")
+        return rv
 
     def get_rate(self, coin_from: str, coin_to: str) -> list:
         """External reference rate BasicSwap looks up for coin_from/coin_to — used
