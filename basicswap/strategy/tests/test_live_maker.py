@@ -825,6 +825,108 @@ class RunCycleBtcObjectiveTests(unittest.TestCase):
         self.assertGreater(float(args[3]), 0.00666 * 1.02)
 
 
+class RestockBookPricingTests(unittest.TestCase):
+    """2026-10-01 restock_pricing='book' (mid = 150 XMR per BTC; lower rate wins)."""
+
+    def setUp(self):
+        self.conn = storage.connect(":memory:")
+        self.client = MagicMock()
+        self.client.get_wallet_balance.side_effect = lambda coin: {"btc": 1.0, "xmr": 0.0}[coin]
+        self.client.get_bids.return_value = []
+        self.client.get_sent_offers.return_value = []
+        self.client.post_offer.return_value = "aaaa"
+        self.monitor = VolatilityMonitor(window_seconds=900)
+
+    def _cfg(self, **overrides):
+        base = dict(half_spread_pct=0.02, objective="btc", assumed_fill_hours=2.5,
+                    restock_expected_sell_premium_pct=0.018, restock_pricing="book",
+                    restock_max_premium_pct=0.005)
+        base.update(overrides)
+        return _cfg(**base)
+
+    def _book(self, *offers):
+        self.client.get_offers.return_value = [
+            dict(dict(is_own_offer=False, is_expired=False, is_revoked=False, min_bid_amount="0.001"), **o)
+            for o in offers
+        ]
+
+    def _posted_rate(self, mock_rate):
+        mock_rate.return_value = _rate()
+        run_cycle(self.client, self.conn, self._cfg(), self.monitor)
+        return float(self.client.post_offer.call_args[0][3])
+
+    @patch("strategy.live_maker.external_rates.get_reference_rate")
+    def test_quotes_just_inside_the_best_competitor_below_mid(self, mock_rate):
+        self._book({"rate": "149.4"}, {"rate": "149.9"})  # best pays 0.4% over mid
+        self.assertAlmostEqual(self._posted_rate(mock_rate), 150.0 * (149.4 / 150.0 - 0.0001), places=6)
+
+    @patch("strategy.live_maker.external_rates.get_reference_rate")
+    def test_never_pays_more_than_the_cap(self, mock_rate):
+        self._book({"rate": "148.5"})  # 1% over mid
+        self.assertAlmostEqual(self._posted_rate(mock_rate), 150.0 * 0.995, places=6)
+
+    @patch("strategy.live_maker.external_rates.get_reference_rate")
+    def test_weak_book_quotes_above_the_cost_price(self, mock_rate):
+        self._book({"rate": "152.0"})
+        self.assertAlmostEqual(self._posted_rate(mock_rate), 150.0 * (152.0 / 150.0 - 0.0001), places=6)
+
+    @patch("strategy.live_maker.external_rates.get_reference_rate")
+    def test_ignores_own_unusable_and_dead_offers(self, mock_rate):
+        self._book(
+            {"rate": "140.0", "is_own_offer": True},
+            {"rate": "140.0", "is_revoked": True},
+            {"rate": "140.0", "min_bid_amount": "0.0624"},  # can't serve a taker our size
+            {"rate": "151.0"},
+        )
+        self.assertAlmostEqual(self._posted_rate(mock_rate), 150.0 * (151.0 / 150.0 - 0.0001), places=6)
+
+    @patch("strategy.live_maker.external_rates.get_reference_rate")
+    def test_empty_book_or_api_error_falls_back_to_cost_price(self, mock_rate):
+        expected = 150.0 * (1 + restock_half_spread_pct(0.0025, 0.008 * SATS_PER_BTC, 2.5, 0.018, None, 900))
+        self._book()
+        self.assertAlmostEqual(self._posted_rate(mock_rate), expected, places=6)
+        self.client.get_offers.side_effect = BasicSwapAPIError("down")
+        self.monitor = VolatilityMonitor(window_seconds=900)  # same vol reading as the first call
+        self.assertAlmostEqual(self._posted_rate(mock_rate), expected, places=6)
+
+    @patch("strategy.live_maker.external_rates.get_reference_rate")
+    def test_reprices_when_outbid_by_less_than_the_drift_threshold(self, mock_rate):
+        self._book({"rate": "149.7"})
+        self.client.get_sent_offers.return_value = [
+            {"offer_id": "live", "rate": "149.8", "amount_from": "0.008", "created_at": time.time(),
+             "is_expired": False, "is_revoked": False}
+        ]
+        self.client.post_offer.return_value = "bbbb"
+        self._posted_rate(mock_rate)
+        self.client.revoke_offer.assert_called_once_with("live", refuse_if_negotiating=True)
+
+    @patch("strategy.live_maker.external_rates.get_reference_rate")
+    def test_no_churn_when_already_on_top_or_capped(self, mock_rate):
+        mock_rate.return_value = _rate()
+        live = {"offer_id": "live", "amount_from": "0.008", "created_at": time.time(),
+                "is_expired": False, "is_revoked": False}
+        for live_rate, book_rate in (("149.6", "149.7"), (f"{150 * 0.995:.8f}", "148.0")):
+            self.client.reset_mock()
+            self._book({"rate": book_rate})
+            self.client.get_sent_offers.return_value = [dict(live, rate=live_rate)]
+            run_cycle(self.client, self.conn, self._cfg(), self.monitor)
+            self.client.revoke_offer.assert_not_called()
+
+    def test_config_guards(self):
+        with self.assertRaises(ValueError):
+            self._cfg(restock_max_premium_pct=0.018)  # >= sell premium: no round-trip profit
+        with self.assertRaises(ValueError):
+            self._cfg(restock_max_premium_pct=-0.001)
+        with self.assertRaises(ValueError):
+            _cfg(coin_from="xmr", coin_to="btc", side="bid", objective="btc", restock_pricing="book",
+                 restock_expected_sell_premium_pct=0.018)
+
+    def test_decide_and_act_refuses_below_the_cap(self):
+        cfg = self._cfg(half_spread_pct=-0.006)
+        with self.assertRaises(ValueError):
+            decide_and_act(self.client, self.conn, cfg, 150.0)
+
+
 class InFlightSentBidTests(unittest.TestCase):
     def test_sent_topup_blocks_the_restock_leg(self):
         from ..live_maker import _in_flight_swaps
@@ -845,6 +947,25 @@ class InFlightSentBidTests(unittest.TestCase):
         client.get_wallet_balance.return_value = 0.985
         cfg = _cfg(coin_from="xmr", coin_to="btc", side="bid", amount_from=None, reserve_coin=0.385, amount_step=0.05)
         self.assertAlmostEqual(_resolve_amount_from(client, cfg), 0.6)
+
+    def test_max_amount_from_caps_dynamic_offer(self):
+        # 2026-09-30: restock fills grow the XMR balance; the sell offer must stay 0.55.
+        client = MagicMock()
+        client.get_wallet_balance.return_value = 1.585
+        cfg = _cfg(
+            coin_from="xmr", coin_to="btc", side="bid", amount_from=None, reserve_coin=0.385,
+            amount_step=0.05, max_amount_from=0.55,
+        )
+        self.assertAlmostEqual(_resolve_amount_from(client, cfg), 0.55)
+
+    def test_max_amount_from_leaves_smaller_offer_alone(self):
+        client = MagicMock()
+        client.get_wallet_balance.return_value = 0.7
+        cfg = _cfg(
+            coin_from="xmr", coin_to="btc", side="bid", amount_from=None, reserve_coin=0.385,
+            amount_step=0.05, max_amount_from=0.55,
+        )
+        self.assertAlmostEqual(_resolve_amount_from(client, cfg), 0.3)
 
 
 if __name__ == "__main__":

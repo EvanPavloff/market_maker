@@ -72,7 +72,11 @@ RESERVE_XMR=0.385        # ~= today's $210 bid-side reserve, now fixed in XMR
 WORKING_XMR=0.6          # XMR the loop may hold beyond the reserve (~half the BTC wallet)
 # --amount-step 0.05 on the sell leg: no dust offers (0.3885 - 0.385 would post
 # 0.0035 XMR) and the posted size doesn't reveal the exact wallet balance.
+MAX_SELL_XMR=0.55        # 2026-09-30: fixed sell-offer size, so restock fills beyond the
+                         # working stock don't grow it into one oversized offer
 SELL_PREMIUM=0.018       # inside BasicSwap's cheapest-XMR-seller median (+1.85%, 14d)
+RESTOCK_MAX_PREMIUM=0.005  # 2026-10-05: book-aware restock pricing (--restock-pricing book): quote
+                           # 0.01% inside the best competing XMR buyer, never more than +0.5% over mid
 RESTOCK_CAP_BTC=0.0075   # per-offer cap; the wallet held 0.00787844 BTC on 2026-09-28
 RESTOCK_TARGET=$(python3 -c "print(round($RESERVE_XMR + $WORKING_XMR, 8))")
 
@@ -81,13 +85,14 @@ nohup ./run_live_maker.sh --loop --coin-from btc --coin-to xmr --side ask \
     --objective btc --amount-from "$RESTOCK_CAP_BTC" \
     --restock-target-coin-to "$RESTOCK_TARGET" \
     --restock-expected-sell-premium-pct "$SELL_PREMIUM" \
+    --restock-pricing book --restock-max-premium-pct "$RESTOCK_MAX_PREMIUM" \
     >>"$SWAP_DATADIR/basicswap_live_maker.log" 2>&1 &
 disown
 
 echo "=== Starting sell leg (xmr->btc, reserve ${RESERVE_XMR} XMR, premium ${SELL_PREMIUM}) ==="
 nohup ./run_live_maker.sh --loop --coin-from xmr --coin-to btc --side bid \
     --objective btc --reserve-coin "$RESERVE_XMR" --half-spread-pct "$SELL_PREMIUM" \
-    --amount-step 0.05 \
+    --amount-step 0.05 --max-amount-from "$MAX_SELL_XMR" \
     >>"$SWAP_DATADIR/basicswap_live_maker_bid.log" 2>&1 &
 disown
 
@@ -98,7 +103,7 @@ echo "-- processes (expect exactly 2) --"
 ps aux | grep live_maker | grep -v grep
 
 echo
-echo "-- startup log lines (expect objective=btc on both) --"
+echo "-- startup log lines (expect objective=btc on both; restock leg logs 'book pricing, best competitor ...') --"
 tail -4 "$SWAP_DATADIR/basicswap_live_maker.log"
 echo "---"
 tail -4 "$SWAP_DATADIR/basicswap_live_maker_bid.log"

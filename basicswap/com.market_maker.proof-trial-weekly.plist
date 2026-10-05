@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Added 2026-09-30: weekly status of the accumulate-BTC proof trial (next_steps.md #17),
+  Wednesdays 09:07 local (the trial started Wed 2026-09-30). Runs strategy/weekly_status.py:
+  fill-ledger sync + proof_report + node/loop health check, writes
+  basicswap/logs/proof_trial_weekly/<date>.txt and posts a macOS notification. Read-only.
+  Same launchd conventions as com.market_maker.fill-ledger.plist (venv python3 directly,
+  logs under basicswap/logs/, not ~/coinswaps). Unload once the trial is decided.
+
+  Install:   cp com.market_maker.proof-trial-weekly.plist ~/Library/LaunchAgents/ && launchctl load ~/Library/LaunchAgents/com.market_maker.proof-trial-weekly.plist
+  Uninstall: launchctl unload ~/Library/LaunchAgents/com.market_maker.proof-trial-weekly.plist && rm ~/Library/LaunchAgents/com.market_maker.proof-trial-weekly.plist
+  Run now:   launchctl start com.market_maker.proof-trial-weekly
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.market_maker.proof-trial-weekly</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/evanpavloff/coinswaps/venv/bin/python3</string>
+        <string>-m</string>
+        <string>strategy.weekly_status</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/evanpavloff/Desktop/Claude/market_maker/basicswap</string>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>3</integer>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>7</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/Users/evanpavloff/Desktop/Claude/market_maker/basicswap/logs/proof_trial_weekly.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/evanpavloff/Desktop/Claude/market_maker/basicswap/logs/proof_trial_weekly.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/evanpavloff/coinswaps/venv/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>SWAP_DATADIR</key>
+        <string>/Users/evanpavloff/coinswaps</string>
+    </dict>
+</dict>
+</plist>

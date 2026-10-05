@@ -1267,3 +1267,112 @@ On Evan's explicit go-ahead: bid `000000006abab37a…` bought 0.59649627 XMR for
 +3.28% over mid (~13k sats seed cost; the dry run's 2.69% offer was gone at submit time).
 Placed 14:35, Completed 15:21. Wallet: 0.98497 XMR, 0.00388973 BTC. The trial is not started
 yet; see `../HANDOFF_2026-09-28.md`.
+
+## 2026-09-28, 19:45: poller + fill-ledger launchd jobs installed and verified
+
+Evan killed the duplicate hand-started pollers (22001/22008, 33204/33211). On the
+first `launchctl load`, both new jobs exited **78 (EX_CONFIG)** without starting
+python and without logging anything. The cause: their `StandardOutPath` was on
+`~/coinswaps`, which is a symlink to `/Volumes/Storage/coinswaps`, and launchd
+couldn't open the log file there. A foreground run of the same command worked fine.
+The venues poller, which logs under the repo, was never affected. Fix: both plists
+now log to `basicswap/logs/{poller,fill_ledger}.log` (gitignored). After reloading,
+both exit 0, the poller writes `kraken_book_snapshots` (the first rows ever), and the
+fill ledger runs. The DB still lives on `~/coinswaps`, and python writing there is
+fine. Only launchd's own file open failed. Next step: the trial restart
+(`../HANDOFF_2026-09-28.md` steps 2–3).
+
+## 2026-09-30: BasicSwap node restarted after a Mac Studio shutdown
+
+The Mac was shut down 2026-09-29 20:41 (clean `basicswap-run` exit in `basicswap.log`) and
+the node did not come back on boot, since nothing auto-starts it. The launchd poller kept
+firing against a refused port 12700 and the fill ledger exited 1. Restarted 09:57 with
+`nohup ~/coinswaps/venv/bin/basicswap-run --datadir=$HOME/coinswaps >> ~/coinswaps/basicswap_run_stdout.log`.
+Verified: API 200, wallets unchanged (0.98497 XMR, 0.00388973 BTC), 0 active offers, 0 swaps
+in flight, poller and fill ledger both exit 0 again. **The proof trial was not running before
+the shutdown and is still not started** (no `~/coinswaps/proof_trial_start`, both `live_maker`
+logs end 2026-09-25). `restart_live_maker_btc.sh` still needs Evan's go-ahead.
+
+## 2026-09-30, 10:27: proof trial STARTED (`next_steps.md` #17)
+
+Evan ran `restart_live_maker_btc.sh` himself. `~/coinswaps/proof_trial_start` = 1790778463
+(2026-09-30 10:27:43 EDT), so the 4-week minimum ends **2026-10-28**. Verified: exactly 2
+`live_maker` processes (PIDs 69839 restock, 69840 sell), both logging `objective=btc`.
+Sell leg posted 0.55 XMR at +1.8% (offer `000000006abd1c60…`, rate 0.00656371); restock leg
+is idle because the wallet already holds the 0.985 XMR target. The sell leg's "previously-tracked
+offer no longer live" warning refers to the 09-25 offer and is expected. This supersedes the
+"still not started" line in the entry above. Score with `./run_fill_ledger.sh` then
+`python3 -m strategy.proof_report`. After any reboot, `basicswap-run` must be started by hand
+before re-running the script (the marker is kept, so the trial clock is not reset).
+
+## 2026-09-30: weekly proof-trial status job installed
+
+`strategy/weekly_status.py` + `com.market_maker.proof-trial-weekly.plist` (Wednesdays 09:07,
+installed and run once, exit 0). Syncs the fill ledger, runs `proof_report`, checks the node
+answers and exactly 2 `live_maker` loops run, writes `logs/proof_trial_weekly/<date>.txt`, and
+posts a macOS notification ("NEEDS ATTENTION" first if health fails). First run, 2.5h in:
+PROVISIONAL BASE, sell offer live and cheapest on BasicSwap in 100% of 30 cycles, 0 fills,
+restock offer not posted (at target). Check-in dates are logged in the workspace `TASKS.md`.
+
+## 2026-09-30, 13:18: sell-leg size cap deployed; first trial sale in flight
+
+On Evan's go-ahead: `--max-amount-from` (new, `LiveMakerConfig.max_amount_from`) caps a
+reserve-sized offer before `--amount-step`; `restart_live_maker_btc.sh` passes
+`MAX_SELL_XMR=0.55`. 2 new tests, 228 passed. Restarted 13:18 (PIDs 11194 restock / 11195 sell),
+trial marker unchanged. Evan chose not to add BTC or raise the restock target.
+
+Found at restart: bid `000000006abd4042…` took **0.3028 XMR for 0.00200001 BTC** (rate 0.00660425)
+from our 0.55 offer at 13:00, state "Script coin locked" (first trial sale). An earlier bid at
+12:27 (`…6abd3884`, 0.3056 XMR) shows Timed-out. So BasicSwap buyers can take part of an offer;
+the cap's original rationale (a large offer being untakeable) doesn't hold, and it now only
+keeps the offer size and XMR-at-risk per offer fixed. Restock leg is logging "wallet has
+0.00388973 BTC, need 0.00484319" until the swap's BTC lands. Expected, not a bug.
+
+## 2026-10-01, 11:40: trial check-in (day 1 of 28)
+
+Health: node (PID 63568) + exactly 2 loops (11194 restock / 11195 sell) up since 09-30 13:18; venues
+poller, fill-ledger, weekly-report launchd jobs all current. Two sell fills completed 09-30
+(0.3028 XMR @13:00, 0.2023 XMR @13:42; margin vs Kraken restock +0.25% / −0.11%), net +8,995 sats
+in-window. Since ~14:18 the sell leg has been idle: XMR is ~0.05 above the 0.385 reserve, so every
+cycle logs `To amount below min value for chain`, which is expected rather than a bug. It can't
+resume until the restock offer (maker, 0.25% half-spread, ~0.0032 BTC) fills, and proof_report
+shows it as the cheapest XMR buyer on BasicSwap in 0% of cycles. If that holds, the trial stops
+testing the sell leg. Watch it at the 10-07 weekly report.
+
+## 2026-10-01, later: book-aware restock pricing built (not deployed)
+
+Evan's call: price the restock offer to get takers, kept inside the round-trip margin. Built
+`--restock-pricing book` + `--restock-max-premium-pct` (default 0.005) in `strategy/live_maker.py`:
+each cycle reads the live BasicSwap book (`get_offers`, own/expired/revoked and offers whose
+`min_bid_amount` exceeds our cap excluded), quotes 0.01% inside the best competitor, never paying more
+than 0.5% over mid (worst case ~1.8% − 0.5% − ~0.4% BTC fees ≈ +0.9% net per round trip). It may quote
+above the cost-model price when the book is weak. It falls back to cost pricing on an empty book or an
+API error. A new `outbid` trigger reprices when a competitor matches or beats our live offer by less
+than the 0.5% drift threshold. 9 new tests, 237 pass. Read-only preview against the live node at
+~12:30: best usable competitor +0.416%, book mode would quote +0.406%; our live offer sat at +0.464%,
+behind it.
+
+Data behind it (21d `offer_snapshots`): no competitor offer ever shrank between polls, and early
+disappearance is flat across book ranks (~8–11%/poll), so the public book can't identify takes. Our
+own offers are the only fill evidence. Best competing XMR buyer vs mid: p10 −0.72%, median +0.22%,
+p90 +1.30%.
+
+**Pending (Evan):** the restart was blocked by the session's permission classifier. To deploy, add
+`--restock-pricing book --restock-max-premium-pct 0.005` to the restock-leg `nohup` line in
+`restart_live_maker_btc.sh`, then run it (trial marker kept). Verify the restock log shows
+`book pricing, best competitor ...` lines.
+
+## 2026-10-05: restock book pricing staged in restart_live_maker_btc.sh (not yet run)
+
+Trial check (day 5 of 28): 4 sell fills (5.5/wk, mean Kraken-restock margin +0.53%), 2 restock fills,
++16,715 sats net in-window, but the sell offer has been live in only 14% of cycles. It has been
+stuck since ~10-02 because XMR is 0.049 above the 0.385 reserve (< one 0.05 amount_step), and the
+cost-priced restock offer is the cheapest XMR buyer in 0% of cycles. Releasing the reserve was
+considered and judged minor: it adds ~0.43 XMR, about one fill, then the same stall. Evan approved
+staging book pricing: `restart_live_maker_btc.sh` now passes `--restock-pricing book
+--restock-max-premium-pct 0.005` (RESTOCK_MAX_PREMIUM) on the restock leg. Sell leg unchanged
+(`--max-amount-from 0.55` was already live, just uncommitted). 237 tests pass. Trial marker is kept;
+this is a mid-trial change to the restock leg only, so read pre/post-10-05 restock fills separately.
+**Deployed 12:58 EDT** (run by Claude on Evan's go-ahead): exactly 2 loops (31643 restock / 31644
+sell). First book-priced cycle: best competitor +0.288%, our restock reposted at ~+0.278% over mid
+(0.00356 BTC, the wallet's available BTC). Sell leg still idle until a restock fill, as expected.

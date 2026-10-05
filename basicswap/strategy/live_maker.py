@@ -197,6 +197,16 @@ class LiveMakerConfig:
     restock_expected_sell_premium_pct: float = 0.0
     restock_min_half_spread_pct: float = 0.0025
     restock_min_amount_from: float = 0.001
+    # 2026-09-30: cap on a dynamic (reserve-sized) offer, applied before amount_step.
+    # Keeps the sell leg's offer size fixed while restock fills grow the balance.
+    max_amount_from: float | None = None
+    # 2026-10-01: restock leg pricing. "cost" = economics.restock_half_spread_pct
+    # alone (always above mid). "book" = just inside the best competing BasicSwap
+    # offer, never paying more than restock_max_premium_pct over mid for coin_to
+    # (see _restock_book_half_spread_pct).
+    restock_pricing: str = "cost"
+    restock_max_premium_pct: float = 0.005
+    restock_book_improve_pct: float = 0.0001
 
     def __post_init__(self):
         sizings = [self.amount_from, self.reserve_usd, self.reserve_coin]
@@ -213,6 +223,18 @@ class LiveMakerConfig:
                 raise ValueError("restock_target_to needs amount_from as the per-offer size cap")
         if self.is_restock_leg and not self.restock_min_half_spread_pct > 0:
             raise ValueError("restock_min_half_spread_pct must be > 0 (offers never go at or below mid)")
+        if self.restock_pricing not in ("cost", "book"):
+            raise ValueError(f"restock_pricing must be 'cost' or 'book', got {self.restock_pricing!r}")
+        if self.restock_pricing == "book":
+            if not self.is_restock_leg:
+                raise ValueError("restock_pricing='book' only applies to the objective='btc' restock leg")
+            # Paying p over mid to restock and selling at the sell leg's premium s
+            # nets s - p before fees; p >= s can't be a profitable round trip.
+            if not 0 <= self.restock_max_premium_pct < self.restock_expected_sell_premium_pct:
+                raise ValueError(
+                    "restock_max_premium_pct must be >= 0 and below restock_expected_sell_premium_pct "
+                    f"(got {self.restock_max_premium_pct} vs {self.restock_expected_sell_premium_pct})"
+                )
 
     @property
     def is_restock_leg(self) -> bool:
@@ -291,11 +313,21 @@ def decide_and_act(
     cfg: LiveMakerConfig,
     reference_mid: float,
     now: float | None = None,
+    beat_rate: float | None = None,
 ) -> str | None:
+    """beat_rate: book-priced restock only, the best competing offer's rate."""
     now = now if now is not None else time.time()
     coin_from, coin_to = coin_names.to_display_name(cfg.coin_from), coin_names.to_display_name(cfg.coin_to)
     target_rate = _offer_rate(reference_mid, cfg.half_spread_pct)
-    if not target_rate > reference_mid:
+    if cfg.restock_pricing == "book":
+        # Book-priced restock may pay up to restock_max_premium_pct over mid, never more.
+        floor_rate = _offer_rate(reference_mid, -cfg.restock_max_premium_pct)
+        if target_rate < floor_rate * (1 - 1e-9):
+            raise ValueError(
+                f"refusing to quote {coin_from}->{coin_to} at {target_rate}: below the "
+                f"restock_max_premium_pct floor {floor_rate} (mid {reference_mid})"
+            )
+    elif not target_rate > reference_mid:
         raise ValueError(
             f"refusing to quote {coin_from}->{coin_to} at {target_rate} <= reference mid "
             f"{reference_mid}: an offer always sells coin_from, so this would sell below market"
@@ -372,7 +404,13 @@ def decide_and_act(
         and float(live_amount) > cfg.amount_from * (1 + cfg.reprice_threshold_pct)
     )
 
-    if drift_pct > cfg.reprice_threshold_pct:
+    # Book-priced restock: a competitor now matches or beats our live offer
+    # (lower rate = fewer coin_to asked per BTC = better for the taker) and this
+    # cycle's target would win the top back. Too small a move for the drift
+    # threshold, but it decides who gets taken.
+    outbid = beat_rate is not None and live_rate >= beat_rate and target_rate < beat_rate
+
+    if drift_pct > cfg.reprice_threshold_pct or outbid:
         action = "reprice"
     elif oversized:
         action = "resize"
@@ -434,6 +472,8 @@ def _resolve_amount_from(client: BasicSwapClient, cfg: LiveMakerConfig) -> float
     # amount instead, so the reserve doesn't drift with the coin's USD price.
     reserve_coin = cfg.reserve_coin if cfg.reserve_coin is not None else cfg.reserve_usd / usd_price
     dynamic_amount = available - reserve_coin
+    if cfg.max_amount_from is not None and dynamic_amount > cfg.max_amount_from:
+        dynamic_amount = cfg.max_amount_from
     if dynamic_amount <= 0:
         reserve_desc = (
             f"~${cfg.reserve_usd:.2f} at ${usd_price:.2f}/coin" if usd_price is not None else "fixed coin reserve"
@@ -507,14 +547,48 @@ def _stand_down_restock(client: BasicSwapClient, cfg: LiveMakerConfig, held_to: 
     )
 
 
+def _best_competing_rate(client: BasicSwapClient, cfg: LiveMakerConfig) -> float | None:
+    """Lowest rate (best for the taker) among other makers' live offers in our
+    direction that a taker of our size could also use (min_bid_amount <= our
+    per-offer cap). None if there are none."""
+    best = None
+    for o in client.get_offers(coin_from=cfg.coin_from, coin_to=cfg.coin_to):
+        if o.get("is_own_offer") or o.get("is_expired") or o.get("is_revoked"):
+            continue
+        try:
+            rate = float(o["rate"])
+            min_bid = float(o.get("min_bid_amount") or 0.0)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if rate <= 0 or min_bid > cfg.amount_from:
+            continue
+        best = rate if best is None else min(best, rate)
+    return best
+
+
+def _restock_book_half_spread_pct(
+    cost_h: float, best_rate: float | None, reference_mid: float, cfg: LiveMakerConfig
+) -> float:
+    """2026-10-01, restock_pricing='book'. A seller of coin_to takes whichever
+    offer asks the fewest coin_to per BTC, so quote just inside the best
+    competitor (restock_book_improve_pct) -- even above our cost-model price
+    when the book is weak -- but never pay more than restock_max_premium_pct over
+    mid (that cap, below the sell leg's premium, is what keeps every round trip
+    profitable before fees). No competitor: the cost-model price."""
+    if best_rate is None:
+        return cost_h
+    book_h = best_rate / reference_mid - 1 - cfg.restock_book_improve_pct
+    return max(book_h, -cfg.restock_max_premium_pct)
+
+
 def _btc_objective_plan(
     client: BasicSwapClient,
     cfg: LiveMakerConfig,
     amount_from: float,
     reference_mid: float,
     vol_pct: float | None,
-) -> tuple[float, float] | None:
-    """(amount_from, half_spread_pct) for this cycle under objective='btc', or None
+) -> tuple[float, float, float | None] | None:
+    """(amount_from, half_spread_pct, beat_rate) for this cycle under objective='btc', or None
     to post nothing. Sell leg: cfg.half_spread_pct as its target premium, widened
     only by excess live vol (economics.sell_leg_half_spread_pct). Restock leg: priced by
     economics.restock_half_spread_pct (floored at cfg.restock_min_half_spread_pct,
@@ -527,9 +601,9 @@ def _btc_objective_plan(
             hold_hours=cfg.assumed_fill_hours,
             live_vol_pct=vol_pct,
             live_vol_window_seconds=window_seconds,
-        )
+        ), None
 
-    def restock_h(amount: float) -> float:
+    def cost_h(amount: float) -> float:
         return economics.restock_half_spread_pct(
             min_half_spread_pct=cfg.restock_min_half_spread_pct,
             notional_sats=amount * SATS_PER_BTC,
@@ -539,8 +613,27 @@ def _btc_objective_plan(
             live_vol_window_seconds=window_seconds,
         )
 
+    best_rate = None
+    if cfg.restock_pricing == "book":
+        try:
+            best_rate = _best_competing_rate(client, cfg)
+        except BasicSwapAPIError as e:
+            log.warning("get_offers failed, restock falls back to cost pricing this cycle: %s", e)
+        log.info(
+            "%s/%s %s: book pricing, best competitor %s (mid %.8f, cap -%.4f)",
+            cfg.coin_from, cfg.coin_to, cfg.side,
+            "none" if best_rate is None else f"{best_rate:.8f} ({best_rate / reference_mid - 1:+.4%})",
+            reference_mid, cfg.restock_max_premium_pct,
+        )
+
+    def restock_h(amount: float) -> float:
+        h = cost_h(amount)
+        if cfg.restock_pricing == "book":
+            h = _restock_book_half_spread_pct(h, best_rate, reference_mid, cfg)
+        return h
+
     if cfg.restock_target_to is None:
-        return amount_from, restock_h(amount_from)
+        return amount_from, restock_h(amount_from), best_rate
 
     try:
         held_to = client.get_wallet_balance(cfg.coin_to)
@@ -558,7 +651,7 @@ def _btc_objective_plan(
     if deficit_to <= 0 or amount < cfg.restock_min_amount_from:
         _stand_down_restock(client, cfg, held_to)
         return None
-    return amount, h
+    return amount, h, best_rate
 
 
 def _pause_for_in_flight_swaps(client: BasicSwapClient, cfg: LiveMakerConfig, in_flight: list[dict]) -> None:
@@ -658,13 +751,14 @@ def run_cycle(
         plan = _btc_objective_plan(client, cfg, amount_from, reference_mid, vol_pct)
         if plan is None:
             return
-        amount_from, half_spread_pct = plan
+        amount_from, half_spread_pct, beat_rate = plan
         log.info(
             "%s/%s %s: objective=btc %s half_spread_pct=%.4f amount=%.8f (%.0f sats notional)",
             cfg.coin_from, cfg.coin_to, cfg.side, "restock" if cfg.is_restock_leg else "sell",
             half_spread_pct, amount_from, _notional_sats(cfg, amount_from, reference_mid),
         )
     else:
+        beat_rate = None
         half_spread_pct = _dynamic_half_spread_pct(cfg, amount_from, rate.usd_price_from, vol_pct)
     if cfg.objective == "usd" and half_spread_pct != cfg.half_spread_pct:
         log.info(
@@ -680,7 +774,7 @@ def run_cycle(
     )
 
     try:
-        decide_and_act(client, conn, cfg_for_cycle, reference_mid, now=now)
+        decide_and_act(client, conn, cfg_for_cycle, reference_mid, now=now, beat_rate=beat_rate)
     except InsufficientBalanceError as e:
         log.error("%s — will keep checking each cycle in case the wallet is funded again.", e)
     except BasicSwapAPIError as e:
@@ -704,10 +798,14 @@ def run(cfg: LiveMakerConfig, loop: bool) -> None:
         sizing = f"amount={cfg.amount_from:.8f}"
     elif cfg.reserve_coin is not None:
         sizing = f"reserve_coin={cfg.reserve_coin:.8f}"
+        if cfg.amount_step is not None:
+            sizing += f" amount_step={cfg.amount_step:.8f}"
     else:
         sizing = f"reserve_usd=${cfg.reserve_usd:.2f}"
         if cfg.amount_step is not None:
             sizing += f" amount_step={cfg.amount_step:.8f}"
+    if cfg.max_amount_from is not None and cfg.amount_from is None:
+        sizing += f" max_amount_from={cfg.max_amount_from:.8f}"
     log.info(
         "LIVE market-making: %s/%s %s, %s half_spread_floor_pct=%.4f "
         "assumed_fill_hours=%.2f reprice_threshold_pct=%.4f offer_valid_hours=%.2f "
@@ -776,6 +874,11 @@ def main(argv: list[str] | None = None) -> int:
         "--reserve-usd/--reserve-coin is required.",
     )
     parser.add_argument(
+        "--max-amount-from", type=float, default=None,
+        help="with --reserve-usd/--reserve-coin: cap the dynamic offer size at this many "
+        "coin_from units (applied before --amount-step). Default None (no cap).",
+    )
+    parser.add_argument(
         "--objective", default="usd", choices=["usd", "btc"],
         help="usd (default, unchanged behavior) or btc: cost the spread in sats, and price an "
         "offer that sells BTC as a restock leg (see the module docstring's Objective note).",
@@ -799,6 +902,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--restock-min-amount-from", type=float, default=0.001,
         help="--objective btc restock leg: don't post a target-limited offer smaller than this.",
+    )
+    parser.add_argument(
+        "--restock-pricing", choices=("cost", "book"), default="cost",
+        help="--objective btc restock leg: 'cost' (default) prices off the cost model, always "
+        "above mid; 'book' quotes just inside the best competing BasicSwap offer, capped by "
+        "--restock-max-premium-pct.",
+    )
+    parser.add_argument(
+        "--restock-max-premium-pct", type=float, default=0.005,
+        help="--restock-pricing book: the most to pay over mid for coin_to. Must stay below "
+        "--restock-expected-sell-premium-pct so a round trip nets positive before fees.",
     )
     parser.add_argument(
         "--amount-step", type=float, default=None,
@@ -907,11 +1021,14 @@ def main(argv: list[str] | None = None) -> int:
         reserve_usd=args.reserve_usd,
         reserve_coin=args.reserve_coin,
         amount_step=args.amount_step,
+        max_amount_from=args.max_amount_from,
         objective=args.objective,
         restock_target_to=args.restock_target_coin_to,
         restock_expected_sell_premium_pct=args.restock_expected_sell_premium_pct,
         restock_min_half_spread_pct=args.restock_min_half_spread_pct,
         restock_min_amount_from=args.restock_min_amount_from,
+        restock_pricing=args.restock_pricing,
+        restock_max_premium_pct=args.restock_max_premium_pct,
         half_spread_pct=args.half_spread_pct,
         assumed_fill_hours=args.assumed_fill_hours,
         reprice_threshold_pct=args.reprice_threshold_pct,

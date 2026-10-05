@@ -8,6 +8,10 @@
   python3 directly (launchd-spawned bash can't read under ~/Desktop here), no
   --loop (launchd's StartInterval is the loop). No .env exists in basicswap/,
   so strategy/config.py's defaults apply, same as the run_*.sh wrappers.
+  Logs go to basicswap/logs/ (gitignored), NOT ~/coinswaps: that path is a
+  symlink to /Volumes/Storage and launchd fails to open StandardOutPath there
+  (job exits 78 EX_CONFIG before python starts, nothing logged). Found 09-28.
+
 
   Install:   cp com.market_maker.basicswap-poller.plist ~/Library/LaunchAgents/ && launchctl load ~/Library/LaunchAgents/com.market_maker.basicswap-poller.plist
   Uninstall: launchctl unload ~/Library/LaunchAgents/com.market_maker.basicswap-poller.plist && rm ~/Library/LaunchAgents/com.market_maker.basicswap-poller.plist
@@ -28,9 +32,9 @@
     <key>StartInterval</key>
     <integer>300</integer>
     <key>StandardOutPath</key>
-    <string>/Users/evanpavloff/coinswaps/basicswap_poller.log</string>
+    <string>/Users/evanpavloff/Desktop/Claude/market_maker/basicswap/logs/poller.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/evanpavloff/coinswaps/basicswap_poller.log</string>
+    <string>/Users/evanpavloff/Desktop/Claude/market_maker/basicswap/logs/poller.log</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
