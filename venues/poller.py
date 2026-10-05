@@ -22,6 +22,7 @@ from . import storage
 from .bisq.reader import BisqOfferBookReader
 from .config import Config, load_config
 from .eigen_asb.reader import EigenAsbOfferBookReader
+from .instant_swap.reader import ChangeNowQuoteReader, ExolixQuoteReader
 from .offer_book import OfferBookReader
 
 log = logging.getLogger("market_maker.venues.poller")
@@ -29,6 +30,9 @@ log = logging.getLogger("market_maker.venues.poller")
 _READERS: dict[str, type[OfferBookReader]] = {
     "bisq": BisqOfferBookReader,
     "eigen_asb": EigenAsbOfferBookReader,
+    # Instant-swap quotes, added 2026-10-02 to price restocking (instant_swap/client.py).
+    "exolix": ExolixQuoteReader,
+    "changenow": ChangeNowQuoteReader,
 }
 
 

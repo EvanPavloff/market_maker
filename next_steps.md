@@ -27,6 +27,16 @@ not duplicated, unless this level changes their priority.
 | 16 | Opportunistic bid-scanning | Built/tested 2026-09-20, not run with `--live` |
 | 17 | Accumulate-BTC proof trial + success bar | **BUILT 2026-09-28** — `proof_report.py`, Kraken book snapshots, sent-bid ledger; trial starts when Evan runs `restart_live_maker_btc.sh` |
 
+## Gemini review (2026-10-02): "XMR toll booth" — mostly already running
+
+Source: the 2026-10-02 Gemini 3.1 Pro review (full context and the net-new ideas are in the workspace-root `profitable_strategies_to_explore.md`). Not started. Same pre-registered, backtest-first rule as everything else here.
+
+Gemini's top pick overall was to quote only the XMR-sell side, at a premium, into Bisq's ~96% one-way XMR-buying flow. That's essentially the #17 proof trial live since 2026-09-30, which ends 2026-10-28 at the earliest. Don't change the trial. Two post-trial items to consider:
+
+- **A higher-premium sensitivity check.** Gemini proposed +4% over spot vs the trial's ~+1.8%. Bisq's median premium is ~1.95%, so +4% likely fills rarely. Read it from the trial's fill-rate-vs-premium data rather than running it live.
+- **Reject Gemini's "hedge BTC back to USD weekly".** It conflicts with the BTC objective (see the 09-28 objective decision).
+- **Legal read before scaling capital.** Gemini framed the edge as "regulatory friction" (buyers paying for privacy/no-KYC). Before scaling past personal-account size, get a lawyer's read on whether repeated market making for others raises money-transmitter questions. Not needed for the current trial.
+
 ## Available to pick up right now (no human decision needed first)
 
 **2026-09-28, later (read this first)**: #17's proof trial and success bar are
@@ -293,6 +303,28 @@ disposed unit. Two paths were evaluated and one was ruled out:
   mitigated by entity structure. **Not decided, not a build item** — needs a
   crypto-savvy CPA/tax attorney to evaluate against actual activity/scale
   before any return relies on it. Logged in `TASKS.md`.
+
+**Required before going live at scale (noted 2026-10-02).** If the proof trial
+(#17) passes and the desk is sized up, build this first. 2026 trial fills are
+already taxable, so it should at least cover them before year-end.
+- **Per-fill record:** dollar value of what was received at the fill (fill_ledger
+  already stores BTC/USD per fill), the purchase lot it draws from, the wallet it
+  sits in, and network fees (these reduce the gain).
+- **Specific identification, recorded at the time of each fill.** Since 2025
+  (Rev. Proc. 2024-28), cost basis is tracked per wallet, and a lot choice made
+  after the fact doesn't count; without one, first-in-first-out applies. Default
+  to the highest-cost lot to keep short-term gains low.
+- **Keep low-cost BTC out of the pool.** Spending old BTC on a restock realizes
+  its whole built-up gain. Fund the pool from recent purchases (e.g.
+  `coinbase_dca`) and keep long-held BTC in a separate wallet.
+- **Output:** Form 8949 lines (short-term digital assets, no 1099-DA) plus a PA-40
+  Schedule D total. No DEX issues a 1099-DA (the DeFi broker rule was repealed in
+  2025); Kraken would, if it's used for restocking.
+- **Scale:** each round trip is about 2 reportable sales, so ~200 lines a year at
+  ~8 round trips a month and ~1,000+ at ~40. Generate them; don't hand-enter.
+- Rough tax at Evan's rates (22% federal, short-term, plus PA 3.07%): about 25% of
+  net gains. The CPA question above (dealer vs. capital) still decides
+  self-employment tax.
 
 ## 6. Venue #2 scoping (live capital) — NOT started, and deliberately not prioritized yet
 
@@ -1600,6 +1632,11 @@ optimistic, so read it as a ceiling.
 **Run:** `./run_fill_ledger.sh` (syncs fills, including sent bids), then
 `python3 -m strategy.proof_report` from `basicswap/`. The fill-ledger launchd job
 does the sync hourly once it's installed.
+
+**Restock side (added 2026-10-02):** `python3 -m venues.restock_cost` from
+`market_maker/` shows the all-in cost to buy 0.5 XMR on each venue we poll
+(BasicSwap, Bisq, Eigen ASB, Exolix, ChangeNOW) against Kraken. If a no-KYC
+venue stays under Kraken's ~+1.0%, a CEX may not be needed for restocking.
 
 ## Explicitly not on this list
 

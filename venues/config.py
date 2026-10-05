@@ -26,7 +26,9 @@ def _parse_venues(raw: str) -> list[str]:
 
 @dataclass(frozen=True)
 class Config:
-    venues: list[str] = field(default_factory=lambda: ["bisq", "eigen_asb"])
+    venues: list[str] = field(
+        default_factory=lambda: ["bisq", "eigen_asb", "exolix", "changenow"]
+    )
     pairs: list[tuple[str, str]] = field(default_factory=lambda: [("xmr", "btc")])
     request_timeout_seconds: float = 10.0
     poll_interval_seconds: int = 300
@@ -35,7 +37,7 @@ class Config:
 
 def load_config() -> Config:
     return Config(
-        venues=_parse_venues(os.environ.get("VENUES_ENABLED", "bisq,eigen_asb")),
+        venues=_parse_venues(os.environ.get("VENUES_ENABLED", "bisq,eigen_asb,exolix,changenow")),
         pairs=_parse_pairs(os.environ.get("VENUES_PAIRS", "xmr/btc")),
         request_timeout_seconds=float(os.environ.get("VENUES_REQUEST_TIMEOUT_SECONDS", "10")),
         poll_interval_seconds=int(os.environ.get("VENUES_POLL_INTERVAL_SECONDS", "300")),

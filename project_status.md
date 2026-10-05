@@ -1012,6 +1012,28 @@ proposed). A target XMR balance caps how much XMR the desk holds.
 `basicswap/project_status.md`'s 2026-09-28 entry. Net position vs. never
 trading: −57,930 sats.
 
+## 2026-10-02: restock-cost tracking across venues (read-only)
+
+The proof trial (day 2) shows the sell leg selling out and the maker restock
+offer filling rarely (one 0.505 XMR fill in 2 days, never the cheapest). To see
+whether any non-KYC venue could restock cheaply enough to skip a CEX:
+
+- `venues/instant_swap/`: Exolix and ChangeNOW quote readers (keyless), added to
+  the venues poller's defaults, so the existing 5-minute launchd job picks them up
+  with no plist change. Verified with one live cycle.
+- `venues/restock_cost.py`: per poll cycle, walks each venue's XMR-sell offers to
+  fill 0.5 XMR and prices it against the Kraken mid, plus fees (partly assumed,
+  in `VENUE_COSTS`). Covers BasicSwap, Bisq, Eigen ASB, Exolix, ChangeNOW, Kraken.
+- Venues checked and ruled out are in `ARCHITECTURE.md` §7 (Trocador needs a key;
+  SideShift has XMR disabled; no XMR on THORChain/Maya/Chainflip).
+- 13 new tests; 47/47 in `venues/tests`.
+
+First read (7 days, all-in for 0.5 XMR, median): Exolix +0.55% (1 sample so
+far), Kraken +1.01%, Eigen ASB +1.59%, Bisq +2.23%, BasicSwap +2.78%,
+ChangeNOW +3.03%. None of the non-KYC DEXes beats Kraken; Eigen ASB is the
+cheapest DEX and cheaper than taking on BasicSwap. The 1,650-sat flat fee is
+about half of Kraken's cost at 0.5 XMR. Re-run after a week of Exolix samples.
+
 ## Handoff for the next session (2026-09-28, supersedes the 2026-09-24 handoff)
 
 0. **Proof trial (`next_steps.md` #17) is built.** To start it: optionally seed
