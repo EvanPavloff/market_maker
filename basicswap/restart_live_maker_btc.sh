@@ -1,14 +1,13 @@
 #!/bin/bash
-# Restart both live_maker loops under the accumulate-BTC objective
+# Restart the sell-leg live_maker loop under the accumulate-BTC objective
+# (restock leg retired 2026-10-27; restocking is Exolix only, see below)
 # (--objective btc, built 2026-09-28 -- see strategy/live_maker.py's "Objective"
 # docstring note and basicswap/project_status.md's 2026-09-28 entry). NOT run by
 # any Claude session: this changes live pricing and needs Evan's go-ahead.
 # restart_live_maker.sh (USD objective) is unchanged and stays the default.
 #
 #   sell leg    xmr->btc  sells XMR above RESERVE_XMR at +SELL_PREMIUM over mid
-#   restock leg btc->xmr  buys XMR back only up to RESERVE_XMR + WORKING_XMR,
-#                         at whatever markup the sell premium doesn't cover
-#                         (+0.39-0.55% at today's inputs, vs. the 2% ask today)
+#   restock     Exolix float swaps (strategy/exolix_restock.py), not a maker offer
 #
 # Proof trial (next_steps.md #17): the first run writes $SWAP_DATADIR/proof_trial_start,
 # which strategy/proof_report.py scores from; later restarts keep the original
@@ -69,41 +68,41 @@ if [ ! -f "$SWAP_DATADIR/proof_trial_start" ]; then
 fi
 
 RESERVE_XMR=0.385        # ~= today's $210 bid-side reserve, now fixed in XMR
-WORKING_XMR=0.6          # XMR the loop may hold beyond the reserve (~half the BTC wallet)
 # --amount-step 0.05 on the sell leg: no dust offers (0.3885 - 0.385 would post
 # 0.0035 XMR) and the posted size doesn't reveal the exact wallet balance.
 MAX_SELL_XMR=0.55        # 2026-09-30: fixed sell-offer size, so restock fills beyond the
                          # working stock don't grow it into one oversized offer
-SELL_PREMIUM=0.018       # inside BasicSwap's cheapest-XMR-seller median (+1.85%, 14d)
-RESTOCK_MAX_PREMIUM=0.005  # 2026-10-05: book-aware restock pricing (--restock-pricing book): quote
-                           # 0.01% inside the best competing XMR buyer, never more than +0.5% over mid
-RESTOCK_CAP_BTC=0.0075   # per-offer cap; the wallet held 0.00787844 BTC on 2026-09-28
-RESTOCK_TARGET=$(python3 -c "print(round($RESERVE_XMR + $WORKING_XMR, 8))")
+MIN_BID_XMR=0.15         # 2026-10-21: smallest partial fill accepted. Each swap pays ~650 sats
+                         # of BTC fees whatever its size (0.43% at 0.15 XMR); the 10-18 0.018 XMR
+                         # dust fill lost money at any premium. Every other trial fill was >= 0.15.
+MIN_LIVE_EDGE=0.01       # 2026-10-22: revoke the live sell offer once it's under +1.0% vs. the
+                         # current mid, even mid-kill-switch (the 10-22 02:14 fill went -2.75%).
+                         # Break-even at the smallest accepted fill: 650 sats on 0.15 XMR (~0.6%)
+                         # plus the ~0.4% Exolix restock cost.
+SELL_PREMIUM=0.021      # 2026-10-21: was 0.018. The trial is stock-constrained, not demand-
+                         # constrained (~20 fills per week of sell-offer uptime), so price up.
+                         # Drop to 0.020 if fills slow sharply.
 
-echo "=== Starting restock leg (btc->xmr, target ${RESTOCK_TARGET} XMR, cap ${RESTOCK_CAP_BTC} BTC) ==="
-nohup ./run_live_maker.sh --loop --coin-from btc --coin-to xmr --side ask \
-    --objective btc --amount-from "$RESTOCK_CAP_BTC" \
-    --restock-target-coin-to "$RESTOCK_TARGET" \
-    --restock-expected-sell-premium-pct "$SELL_PREMIUM" \
-    --restock-pricing book --restock-max-premium-pct "$RESTOCK_MAX_PREMIUM" \
-    >>"$SWAP_DATADIR/basicswap_live_maker.log" 2>&1 &
-disown
+# 2026-10-27: restock leg (btc->xmr maker offer) retired on Evan's call; Exolix only
+# (strategy/exolix_restock.py, launchd every 15 min). Over the trial it filled 13 times at
+# -20,422 sats vs. mid at fill and -38,859 at +1h: it got filled just before XMR dropped,
+# plus ~400 sats of network fees per fill. Exolix restocks averaged +0.40% all-in. The stop
+# above still runs, so a restart kills any leftover restock process.
 
 echo "=== Starting sell leg (xmr->btc, reserve ${RESERVE_XMR} XMR, premium ${SELL_PREMIUM}) ==="
 nohup ./run_live_maker.sh --loop --coin-from xmr --coin-to btc --side bid \
     --objective btc --reserve-coin "$RESERVE_XMR" --half-spread-pct "$SELL_PREMIUM" \
-    --amount-step 0.05 --max-amount-from "$MAX_SELL_XMR" \
+    --amount-step 0.05 --max-amount-from "$MAX_SELL_XMR" --min-bid-amount "$MIN_BID_XMR" \
+    --min-live-edge-pct "$MIN_LIVE_EDGE" \
     >>"$SWAP_DATADIR/basicswap_live_maker_bid.log" 2>&1 &
 disown
 
 sleep 3
 echo
 echo "=== Verification ==="
-echo "-- processes (expect exactly 2) --"
+echo "-- processes (expect exactly 1, the sell leg) --"
 ps aux | grep live_maker | grep -v grep
 
 echo
-echo "-- startup log lines (expect objective=btc on both; restock leg logs 'book pricing, best competitor ...') --"
-tail -4 "$SWAP_DATADIR/basicswap_live_maker.log"
-echo "---"
+echo "-- startup log lines (expect objective=btc) --"
 tail -4 "$SWAP_DATADIR/basicswap_live_maker_bid.log"

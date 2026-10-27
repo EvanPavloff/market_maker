@@ -119,6 +119,14 @@ class BasicSwapClientTests(unittest.TestCase):
         self.assertEqual(payload["automation_strat_id"], "1")
         self.assertEqual(payload["lockhrs"], "24")
         self.assertEqual(payload["validhrs"], "6")
+        self.assertNotIn("amt_bid_min", payload)
+
+    @patch("strategy.api_client.urllib.request.urlopen")
+    def test_post_offer_sends_min_bid_amount_as_amt_bid_min(self, mock_urlopen):
+        mock_urlopen.return_value = _fake_response({"offer_id": "deadbeef"})
+        self.client.post_offer("xmr", "btc", "0.55000000", "0.0071", min_bid_amount="0.25000000")
+        payload = json.loads(mock_urlopen.call_args[0][0].data)
+        self.assertEqual(payload["amt_bid_min"], "0.25000000")
 
     @patch("strategy.api_client.urllib.request.urlopen")
     def test_post_offer_omits_automation_strat_id_when_none(self, mock_urlopen):

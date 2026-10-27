@@ -48,9 +48,14 @@ KRAKEN_TAKER_FEE_PCT = 0.004
 # Used only when no kraken_book_snapshots row is near a fill (measured 2026-09-28:
 # buying 1-5 XMR cost +0.116-0.123% over mid).
 KRAKEN_FALLBACK_BUY_COST_PCT = 0.0012
-# Per round trip: the atomic swap's BTC fees (economics.py's "today" figure) plus
-# an assumed ~1,000 sats for the BTC deposit to Kraken and the XMR withdrawal fee.
-TRANSFER_FEE_SATS = economics.DEFAULT_ASSUMPTIONS.fee_round_trip_sats_today + 1000
+# Per fill: the atomic swap's BTC fees (economics.py's "today" figure, ~650 sats).
+SWAP_FEE_SATS = economics.DEFAULT_ASSUMPTIONS.fee_round_trip_sats_today
+# Per restock batch, not per fill (2026-10-21): an assumed ~1,000 sats for the BTC
+# deposit to Kraken and the XMR withdrawal. A restock would be done once per
+# KRAKEN_BATCH_XMR sold (one full-size sell offer), so each fill carries its
+# pro-rata share. Charging it per fill made a 0.018 XMR dust fill score -9.8%.
+KRAKEN_TRANSFER_SATS = 1000
+KRAKEN_BATCH_XMR = 0.55
 # For the $/yr projection: each fill scaled to about half a $5k pot, which is also
 # roughly Bisq's median XMR trade (~0.03 BTC). Assumes the fill rate holds at that
 # size, which is optimistic.
@@ -108,7 +113,9 @@ class TrialMetrics:
     sell_fills: list[SellFill] = field(default_factory=list)
     restock_fills: list[sqlite3.Row] = field(default_factory=list)
     taker_fills: list[sqlite3.Row] = field(default_factory=list)
+    exolix_swaps: list[dict] = field(default_factory=list)
     net_sats: float | None = None
+    wallet_pnl: dict | None = None  # see wallet_pnl()
 
     @property
     def weeks(self) -> float:
@@ -120,8 +127,11 @@ class TrialMetrics:
 
     @property
     def mean_margin_pct(self) -> float | None:
-        vals = [f.margin_pct for f in self.sell_fills if f.margin_pct is not None]
-        return sum(vals) / len(vals) if vals else None
+        """Size-weighted (by BTC received): total margin sats / total sats sold.
+        A simple average let one dust fill outweigh nine full-size ones."""
+        scored = [f for f in self.sell_fills if f.margin_pct is not None]
+        volume = sum(f.btc for f in scored)
+        return sum(f.margin_pct * f.btc for f in scored) / volume if volume > 0 else None
 
     @property
     def n_margins(self) -> int:
@@ -183,8 +193,11 @@ def sell_fill(conn: sqlite3.Connection, r: sqlite3.Row) -> SellFill:
     basis, label = (r["markout_1h_pct"], "+1h") if r["markout_1h_pct"] is not None else (r["edge_pct_at_fill"], "@fill")
     cost, measured = kraken_restock_cost(conn, r["bid_created_at"], r["amount_from"])
     margin = None
-    if basis is not None and r["amount_to"] > 0:
-        fee_pct = TRANSFER_FEE_SATS / (r["amount_to"] * SATS_PER_BTC)
+    if basis is not None and r["amount_to"] > 0 and r["amount_from"] > 0:
+        btc_per_xmr = r["amount_to"] / r["amount_from"]
+        fee_pct = SWAP_FEE_SATS / (r["amount_to"] * SATS_PER_BTC) + KRAKEN_TRANSFER_SATS / (
+            KRAKEN_BATCH_XMR * btc_per_xmr * SATS_PER_BTC
+        )
         margin = basis - cost - KRAKEN_TAKER_FEE_PCT - fee_pct
     return SellFill(
         created_at=r["bid_created_at"], xmr=r["amount_from"], btc=r["amount_to"],
@@ -212,11 +225,43 @@ def collect(
             m.sell_fills.append(sell_fill(conn, r))
         elif r["coin_from"] == BTC and r["coin_to"] == XMR:
             m.restock_fills.append(r)
+    m.exolix_swaps = [s for s in storage.fetch_exolix_swaps(conn, since) if s["created_at"] < until]
     m.net_sats = None
     marked = mark_to_btc(net_flows(rows), {XMR: btc_per_xmr_now} if btc_per_xmr_now else None)
     if marked is not None:
         m.net_sats = marked * SATS_PER_BTC
+        # Completed Exolix restocks are BTC out, XMR in, like a restock fill.
+        if btc_per_xmr_now:
+            for s in m.exolix_swaps:
+                if s["status"] == "success":
+                    m.net_sats += ((s["delivered_xmr"] or 0) * btc_per_xmr_now - s["amount_btc"]) * SATS_PER_BTC
+    m.wallet_pnl = wallet_pnl(conn, until, btc_per_xmr_now)
     return m
+
+
+def wallet_pnl(conn: sqlite3.Connection, until: float, btc_per_xmr_now: float | None) -> dict | None:
+    """Ground truth, net of every fee (2026-10-21): the newest wallet snapshot with no
+    swap in flight, minus each coin's latest baseline and the deposits/withdrawals
+    recorded after it (capital_flows.py), marked to BTC at today's price. None until
+    there is a snapshot and a baseline for both coins."""
+    snap = storage.latest_clean_wallet_snapshot(conn, (BTC, XMR), until)
+    if snap is None or not btc_per_xmr_now:
+        return None
+    at, balances = snap
+    flows = storage.fetch_capital_flows(conn, until=at)
+    delta, baseline_at = {}, 0.0
+    for coin in (BTC, XMR):
+        rows = [f for f in flows if f["coin"] == coin]
+        base = [i for i, f in enumerate(rows) if f["kind"] == "baseline"]
+        if not base:
+            return None
+        rows = rows[base[-1]:]
+        baseline_at = max(baseline_at, rows[0]["at"])
+        delta[coin] = balances[coin] - sum(f["amount"] for f in rows)
+    return {
+        "at": at, "baseline_at": baseline_at, "delta_btc": delta[BTC], "delta_xmr": delta[XMR],
+        "sats": (delta[BTC] + delta[XMR] * btc_per_xmr_now) * SATS_PER_BTC,
+    }
 
 
 def classify(m: TrialMetrics, bar: SuccessBar = SUCCESS_BAR) -> tuple[str, list[str]]:
@@ -293,10 +338,11 @@ def report(m: TrialMetrics, bar: SuccessBar = SUCCESS_BAR) -> str:
             )
         lines.append(
             f"  margin = basis - Kraken depth cost - {KRAKEN_TAKER_FEE_PCT:.2%} Kraken fee (assumed) - "
-            f"{TRANSFER_FEE_SATS:,.0f} sats network/transfer fees (partly assumed); * = no Kraken snapshot, "
+            f"{SWAP_FEE_SATS:,.0f} sats swap fees per fill - {KRAKEN_TRANSFER_SATS:,.0f} sats Kraken transfers "
+            f"per {KRAKEN_BATCH_XMR} XMR restocked (assumed); * = no Kraken snapshot, "
             f"{KRAKEN_FALLBACK_BUY_COST_PCT:.2%} used"
         )
-        lines.append(f"  mean margin: {_pct(m.mean_margin_pct)} over {m.n_margins} fill(s)")
+        lines.append(f"  mean margin (size-weighted): {_pct(m.mean_margin_pct)} over {m.n_margins} fill(s)")
         if m.sell_fills_per_week is not None and m.mean_margin_pct is not None:
             proj = m.sell_fills_per_week * 52 * PROJECTION_LOT_USD * m.mean_margin_pct
             lines.append(
@@ -315,10 +361,36 @@ def report(m: TrialMetrics, bar: SuccessBar = SUCCESS_BAR) -> str:
         lines.append(f"  mean edge @fill: {_pct(sum(edges) / len(edges))} (positive = we bought XMR below mid)")
     if m.taker_fills:
         lines.append(f"\nBids we sent (top-ups/bid_scanner) in the window: {len(m.taker_fills)}")
+    if m.exolix_swaps:
+        done = [s for s in m.exolix_swaps if s["status"] == "success"]
+        lines += ["", "Exolix restocks (exolix_restock.py, BTC -> XMR):",
+                  f"  {len(done)} completed, {len(m.exolix_swaps) - len(done)} other "
+                  f"(in flight / not funded / failed)"]
+        if done:
+            btc = sum(s["amount_btc"] for s in done)
+            xmr = sum(s["delivered_xmr"] or 0 for s in done)
+            cost = sum(s["amount_btc"] * s["all_in_premium_pct"] for s in done) / btc
+            lines.append(f"  {btc:.8f} BTC -> {xmr:.8f} XMR, mean all-in cost {cost:+.2%} vs. mid at the time")
     lines += [
         "",
-        "Net position vs. never having traded (all completed fills in the window, today's price): "
+        "Net position vs. never having traded (all completed fills and Exolix restocks in the window, today's price): "
         + ("n/a" if m.net_sats is None else f"{m.net_sats:+,.0f} sats"),
+        "  (gross: no network fees; the line below is the real figure)",
+    ]
+    w = m.wallet_pnl
+    if w is None:
+        lines.append("Actual wallet P&L: n/a (needs a wallet snapshot from poller.py and a baseline "
+                     "per coin from strategy/capital_flows.py)")
+    else:
+        lines += [
+            f"Actual wallet P&L since {_when(w['baseline_at'])} (balances at {_when(w['at'])}, no swap in flight, "
+            f"less recorded deposits/withdrawals; includes every fee): "
+            f"BTC {w['delta_btc']:+.8f}, XMR {w['delta_xmr']:+.8f} -> {w['sats']:+,.0f} sats at today's price",
+        ]
+        if m.net_sats is not None:
+            lines.append(f"  gap vs. the fill-based figure: {w['sats'] - m.net_sats:+,.0f} sats "
+                         "(network fees, plus anything the fills ledger misses)")
+    lines += [
         "",
         f"Bar: >= {bar.min_weeks:.0f} weeks. PESSIMISTIC < {bar.pessimistic_max_fills_per_week} sell fills/week, or "
         f"mean margin <= 0 over >= {bar.margin_min_fills} fills. OPTIMISTIC >= {bar.optimistic_min_fills_per_week} "

@@ -65,6 +65,10 @@ class VolatilityMonitor:
         cutoff = ts - self.window_seconds
         self._samples = [(t, m) for t, m in self._samples if t >= cutoff]
 
+    def latest(self) -> tuple[float, float] | None:
+        """The most recent (ts, mid) sample, or None."""
+        return self._samples[-1] if self._samples else None
+
     def volatility_pct(self, within_seconds: float | None = None) -> float | None:
         """(max-min)/mean over the trailing within_seconds (default: the whole
         retained window), measured back from the newest sample. None with fewer

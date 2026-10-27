@@ -1,6 +1,6 @@
 # Market Maker — Project Status
 
-**Latest: see the 2026-09-24 handoff at the end of this file.** Status as of 2026-09-18: one live venue (BasicSwap), real money, real
+**Latest: see the 2026-10-21 handoff at the end of this file (node frozen, Mac reboot, Exolix auto-restock in dry run).** Status as of 2026-09-18: one live venue (BasicSwap), real money, real
 fills, now with its own GitHub repo. Three safety controls built and
 deployed this session: a volatility kill-switch (#1), a duplicate-instance
 PID guard (#9), and a source-disagreement gate (#10) — the last one built
@@ -1055,3 +1055,136 @@ about half of Kraken's cost at 0.5 XMR. Re-run after a week of Exolix samples.
    the net-position score.
 5. Unchanged: kill-switch 15-min threshold loosening (0.85%→1.2%) is Evan's
    call; #5 tax lots is unblocked but low priority.
+
+## Handoff for the next session (2026-10-21, after a Mac reboot; supersedes the 2026-09-28 handoff)
+
+**Situation in one line:** the accumulate-BTC proof trial (`next_steps.md` #17, live since
+2026-09-30 10:27) has been offline since 10:53 on 10-21 because the BasicSwap node froze. Evan
+is rebooting the Mac to clear it. Your job: confirm the node and loops are healthy, check the
+Exolix auto-restock dry run, and (if it reads sane numbers) switch it to live.
+
+### Step 1: verify the restart (Evan does the starting; you check)
+Evan's post-reboot steps: confirm `ls ~/coinswaps | head` works (Storage drive mounted), start
+`nohup ~/coinswaps/venv/bin/basicswap-run --datadir=$HOME/coinswaps >> ~/coinswaps/basicswap_run_stdout.log 2>&1 &`,
+check `curl -s -m 10 -o /dev/null -w "%{http_code}\n" http://localhost:12700/json/` prints 200,
+then `cd ~/Desktop/Claude/market_maker/basicswap && ./restart_live_maker_btc.sh`.
+You verify:
+- exactly 2 `strategy.live_maker` processes (`ps aux | grep live_maker | grep -v grep`); the
+  sell leg (`--coin-from xmr --coin-to btc`) must show `--half-spread-pct 0.021` and
+  `--min-bid-amount 0.15`.
+- `basicswap/logs/poller.log` shows "polled N live offer(s)" lines after the restart, not
+  "Connection refused".
+- **Caveat: Claude's shell can't read `/Volumes/Storage`** (`~/coinswaps` is a symlink to it;
+  "Permission denied", macOS privacy). So you can't read the DB, `~/coinswaps/*.log`, or the halt
+  file directly, and your own `curl` to the node may misbehave. Check health through the
+  launchd logs under `basicswap/logs/` (they run with drive access), or ask Evan to run a command.
+
+### Step 2: the Exolix auto-restock (dry run -> live)
+`basicswap/strategy/exolix_restock.py` + launchd `com.market_maker.exolix-restock` (every 15 min,
+loaded, **dry run: no `--live`**). Built 10-21 on Evan's explicit approval; design, caps and halt
+conditions are in its docstring and `basicswap/project_status.md` 10-21 entries. 265/265 tests.
+- Read `basicswap/logs/exolix_restock.log`. Each run logs one line: `none` (stock fine), `skip`
+  (with reason), or `DRY RUN, would swap: {...}`. Sanity-check `have_xmr` (wallet XMR, about
+  0.4-1.0 expected), `above_reserve`, and when it would swap, `amount_btc` (<= 0.004),
+  `quoted_xmr`, `mid` (~0.007 BTC/XMR) and `premium` (expect ~+0.5-0.8%, cap +1.0%).
+- If those look right, switch to live: add `<string>--live</string>` after
+  `<string>strategy.exolix_restock</string>` in BOTH `basicswap/com.market_maker.exolix-restock.plist`
+  and `~/Library/LaunchAgents/` (copy), then `launchctl unload` + `launchctl load` it. Evan is in
+  manual-approval mode for this; auto mode's classifier blocked this money-moving code twice.
+- After the first live swap: confirm a row went `created` -> `sent` -> `success` (the
+  log says "LIVE: sent ..." then "swap ... complete"), and the XMR shows up in the sell offer.
+- If it halts: macOS notification + `~/coinswaps/exolix_restock.halt`. Read the reason in the
+  log, check by hand, then Evan clears it with `rm ~/coinswaps/exolix_restock.halt`.
+
+### Step 3: add a node-health alert (promised to Evan, not built)
+The node was dead ~3h before anyone noticed. Add a check (e.g. in the Exolix job, which already
+runs every 15 min) that sends a macOS notification when the node API hasn't answered for 15
+minutes. Same `_notify` helper as `weekly_status.py`.
+
+### What happened on 10-21 (so you don't re-derive it)
+- **Week-3 trial report** (`basicswap/logs/proof_trial_weekly/2026-10-21.txt`): 19 sell fills
+  (6.35/wk), sell offer live only 32% of poller cycles, net +14,410 sats vs. never trading.
+  Scored PESSIMISTIC on a -0.43% simple-mean margin, driven by one 0.018 XMR dust fill.
+- **Report fixed** (Evan: optimize for a fast answer, mid-trial changes are fine): Kraken
+  transfer fee charged per 0.55 XMR batch, not per fill; margin size-weighted. Rescored by hand:
+  **+0.46%**. Under the current rules that is INCONCLUSIVE, not BASE, because sell uptime (32%)
+  is checked first and cumulative uptime can't reach 50% by 10-28. Proposed and NOT made (needs
+  Evan's OK): judge on a minimum fill count instead of uptime, and report fills per live-week.
+- **Live changes** (in `basicswap/restart_live_maker_btc.sh`): 0.15 XMR minimum fill
+  (`--min-bid-amount`, BasicSwap `amt_bid_min`); sell premium 1.8% -> **2.1%**, because the
+  trial is short of XMR, not buyers (~20 fills per week of uptime). Drop to 2.0% if fills slow
+  sharply. **Neither has actually been posted yet**: both restarts (12:44, 13:42) hit the frozen node.
+- **The freeze:** the node's log stops at 10:53:12 on a `KeyError: 6` traceback in BasicSwap's
+  `lookupRates` (6 = Monero; the poller called /json/rateslist that second). An exception
+  there shouldn't freeze the process, and after `kill` the node AND its bitcoind/monerod/particld
+  sat in ps STAT `UNE` (exiting, stuck in uninterruptible kernel wait). So the likely cause is a
+  disk I/O stall on the Storage drive, not the KeyError. Not proven. Evan's 14:12 start
+  attempt failed: it found the old daemons and `particl-cli stop` timed out. If it freezes
+  again, look at the drive (and the `lookupRates` KeyError) first.
+- **Restock venues** (`python3 -m venues.restock_cost`, 7d, 0.5 XMR all-in median): Exolix
+  +0.66%, Kraken +0.97%, Eigen ASB +1.45%, Bisq +1.90%, BasicSwap taker +2.94%, ChangeNOW
+  +3.04%. Our own maker restock offer pays ~+0.39% but filled only 12 times in 3 weeks.
+- **Exolix facts, checked live:** no API key needed to create a swap; float quotes beat fixed by ~1%;
+  Cloudflare blocks curl's and urllib's default User-Agent (the client uses a browser UA); terms
+  bar only sanctioned users/jurisdictions, but a deposit flagged as suspicious can be held for documents.
+
+### Dates
+- 2026-10-28: the original 4-week minimum. Treat it as a progress check; the changes above
+  need 1-2 weeks of fills, so the real verdict is ~11-04.
+- Weekly report job runs Wednesdays 09:07 (`basicswap/logs/proof_trial_weekly/`).
+
+Nothing from 10-21 is committed (market_maker is its own git repo).
+
+### Update, 2026-10-21 16:00 (same session, after the reboot)
+- **Step 1 done.** The node is up (one stale-cookie restart needed; see `CLAUDE.md` 3b), and
+  both loops are healthy. The sell leg has no XMR above one step to post.
+- **Step 2 done.** The Exolix restock has been LIVE since 15:51. Its first run skipped (+1.05% >
+  cap). Next: confirm the first real swap goes `created` -> `sent` -> `success` and the sell
+  leg then posts at 2.1% / 0.15 min.
+- **Step 3 still open:** the node-health alert.
+- **New:** real wallet P&L tracking. The first reading is **-4,389 sats** after fees, vs.
+  +7,876 sats on the gross fill ledger. Details are in `basicswap/project_status.md`.
+  Manual fund moves must now be recorded with `strategy.capital_flows`.
+- **Still needs Evan:** the proposed judging change (fill count instead of uptime).
+
+### Update, 2026-10-23 (docs pass; nothing new built)
+- **Exolix live swaps:** two completed, no halt.
+  - 10-21 16:06: 0.00366 BTC -> 0.49979 XMR, +0.64%; 99.6% of the quote delivered.
+  - 10-22 02:52: 0.00398 BTC -> 0.50378 XMR, +0.17%.
+- **Stock:** wallet XMR is back to 0.98497, about the trial-start amount. The job logs `none`
+  (0.60 XMR above the reserve), so the sell leg has stock again.
+- **Report on 10-23:**
+  - Verdict: PROVISIONAL INCONCLUSIVE.
+  - 21 sell fills (6.37/wk); margin +0.09% size-weighted.
+  - Actual wallet P&L **-8,364 sats** (almost all BTC, since XMR is at baseline), vs.
+    +5,222 gross.
+- **Processes:** the node plus 2 loops are running (3 total), and the poller is writing
+  wallet snapshots every cycle.
+- **Next:**
+  - Build the node-health alert.
+  - Get Evan's call on the judging rule.
+  - Progress check on 10-28; real verdict ~11-04.
+  - Commit the 10-21 work (nothing committed; market_maker is its own repo).
+
+### Update, 2026-10-27 (check-in: trial offline 4 days, profitability read)
+- **Down since ~10-23 15:00.** Every log stops then: poller 14:53, Exolix 14:55, fill ledger 14:41.
+  `/Volumes/Storage` is not mounted, and no external disk shows in `diskutil`. The node
+  (PID 13708) and all 4 daemons sit in `UNE`, the 10-21 signature, so the drive is the likely
+  cause of both freezes. All launchd jobs exit 78. The 2 loops (PIDs 96016/96017) are alive
+  against a dead node. 0 swaps were in flight at the last poll. Logged in `TASKS.md`. Recovery
+  needs Evan: drive plus a reboot.
+- **Profitability as of the last data (10-23):** actual wallet P&L -8,364 sats (-4,389 on 10-21,
+  -13,252 on 10-22), about -0.8% on ~0.011 BTC of capital over 3.5 weeks. There is no upward
+  trend, only noise around slightly negative. The sell leg ("bid" process, xmr->btc), trial
+  period: 21 fills, +68,956 sats vs. mid at fill, +57,200 at +1h. It isn't being adversely
+  selected. The restock maker leg ("ask" process): 13 fills, -20,422 at fill, -38,859 at +1h.
+  Fees (~400 sats/fill), restock cost and inventory timing eat the gap to the wallet.
+- **Restock maker leg retired (2026-10-27, Evan's call).** `basicswap/restart_live_maker_btc.sh`
+  now starts only the sell leg. It still stops a leftover restock process if one is running.
+  Restocking is Exolix only (`com.market_maker.exolix-restock`, unchanged caps; it already
+  triggers on stock, not on the maker leg). The running restock loop (PID 96016) was stopped
+  at once. Expect exactly 1 `live_maker` process from now on. Note: Exolix's
+  `max_btc_per_week` of 0.015 (~2 XMR) is about the trial's average weekly sell volume, so it
+  could bind in a busy week.
+- **After the reboot, still to do:** check `/json/sentoffers` for any old btc->xmr offer of ours
+  still active and revoke it.

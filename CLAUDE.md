@@ -56,11 +56,22 @@ at face value.
    diagnose accordingly rather than just reloading and hoping.
 
 3. **Verify BasicSwap's live process count is exactly what it should be**
-   (currently 2 — ask + bid): `ps aux | grep live_maker | grep -v grep`. A
+   (currently 1, the xmr->btc sell leg; the btc->xmr restock leg was retired 2026-10-27 in favor of Exolix-only restocking): `ps aux | grep live_maker | grep -v grep`. A
    duplicate/orphaned process has happened before (2026-09-17). Cross-check
    via BasicSwap's own `/json/sentoffers` for an actual offer collision
    before assuming one occurred, and before killing anything with real
    capital behind it.
+
+3b. **After any unclean node stop (reboot, crash, `kill -9`), watch the
+   first restart for a stale RPC cookie.** The node can read a leftover
+   `particl/.cookie` a moment before particld rewrites it, then retries
+   PART RPC 15 times and never connects (2026-10-21). Signature:
+   `particl/debug.log` shows `ThreadRPCServer incorrect password attempt
+   from 127.0.0.1` on every retry, while `basicswap.log` shows "Can't
+   connect to PART RPC". Fix: `kill -INT` the `basicswap-run` PID, wait for
+   its daemons to exit (a clean stop deletes the cookie), start it once.
+   Also run the start command only once; a second `basicswap-run` finds
+   the running daemons and tries to stop them.
 
 4. **Read the most recent "Handoff for the next session" in
    `project_status.md`** (this file and `basicswap/project_status.md`)

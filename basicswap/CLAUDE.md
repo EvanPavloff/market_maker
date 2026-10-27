@@ -58,3 +58,11 @@ human-initiated, no mnemonic/private key is ever generated through or logged
 into a Claude session (`ARCHITECTURE.md` §4), and any further escalation (a
 bigger size, unattended launchd scheduling) is its own separate decision, not
 implied by this one.
+
+**Record every manual fund movement (2026-10-21).** `proof_report.py`'s
+"Actual wallet P&L" line is real wallet balances (`wallet_snapshots`, written
+by the poller) minus a baseline and recorded deposits/withdrawals. Any time
+money goes into or out of the BasicSwap wallets other than through a trade
+(a seed top-up, a Kraken transfer, sweeping BTC out), record it with
+`python3 -m strategy.capital_flows add ...` or the P&L reads it as profit or
+loss. BasicSwap fills and Exolix restocks are trades, not flows.

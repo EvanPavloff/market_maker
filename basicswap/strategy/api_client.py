@@ -171,6 +171,34 @@ class BasicSwapClient:
             )
         return float(entry["balance"])
 
+    def get_wallets(self) -> dict:
+        """Every coin's /json/wallets entry, keyed by uppercase ticker."""
+        wallets = self._post("/json/wallets", {})
+        if not isinstance(wallets, dict):
+            raise BasicSwapAPIError(f"unexpected response from /json/wallets: {wallets!r}")
+        return wallets
+
+    def get_wallet(self, coin: str) -> dict:
+        """One coin's full /json/wallets entry: balance, unconfirmed,
+        deposit_address, and (XMR) main_address — BasicSwap v0.18.8
+        getWalletInfo."""
+        wallets = self._post("/json/wallets", {})
+        entry = wallets.get(coin.upper()) if isinstance(wallets, dict) else None
+        if not isinstance(entry, dict) or "balance" not in entry:
+            raise BasicSwapAPIError(f"no usable wallet info for {coin!r} in /json/wallets: {entry!r}")
+        return entry
+
+    def withdraw(self, coin: str, address: str, value: str) -> str:
+        """Sends `value` (decimal string, human units) of a non-XMR coin to an
+        external `address`, network fee paid on top (subfee=false). IRREVERSIBLE:
+        funds leave the node's wallet. Only exolix_restock.py calls this. Returns
+        the txid."""
+        rv = self._post(f"/json/wallets/{coin.lower()}/withdraw",
+                        {"address": address, "value": value, "subfee": False})
+        if not isinstance(rv, dict) or not rv.get("txid"):
+            raise BasicSwapAPIError(f"unexpected response from withdraw: {rv!r}")
+        return rv["txid"]
+
     def get_sent_offers(
         self, coin_from: str | None = None, coin_to: str | None = None, limit: int = 100
     ) -> list[dict]:
@@ -196,6 +224,7 @@ class BasicSwapClient:
         lock_hours: float = 24,
         valid_hours: float = 6,
         automation_strat_id: int | None = 1,
+        min_bid_amount: str | None = None,
     ) -> str:
         """Posts a real, live offer selling `amount_from` of coin_from for
         coin_to at `rate` (coin_to per coin_from, matching analysis.py's
@@ -205,7 +234,9 @@ class BasicSwapClient:
         that move real funds. `automation_strat_id=1` (default) uses
         BasicSwap's own built-in "Accept All" strategy (exact_rate_only=True,
         max_concurrent_bids=1, confirmed live 2026-09-17) — pass None for a
-        manual-accept-only offer.
+        manual-accept-only offer. `min_bid_amount` (coin_from units, decimal
+        string, <= amount_from) is the smallest partial fill BasicSwap will
+        accept — v0.18.8's parseOfferFormData reads it as `amt_bid_min`.
 
         Returns the new offer's id (hex string).
         """
@@ -219,6 +250,8 @@ class BasicSwapClient:
         }
         if automation_strat_id is not None:
             payload["automation_strat_id"] = str(automation_strat_id)
+        if min_bid_amount is not None:
+            payload["amt_bid_min"] = min_bid_amount
         rv = self._post("/json/offers/new", payload)
         if not isinstance(rv, dict) or "offer_id" not in rv:
             raise BasicSwapAPIError(f"unexpected response from /json/offers/new: {rv!r}")

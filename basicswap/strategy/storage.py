@@ -189,7 +189,115 @@ CREATE TABLE IF NOT EXISTS kraken_book_snapshots (
     buy_cost_5xmr_pct REAL
 );
 CREATE INDEX IF NOT EXISTS idx_kraken_book_snapshots_time ON kraken_book_snapshots (polled_at);
+
+-- Automated BTC->XMR restocks through Exolix (2026-10-21, exolix_restock.py).
+-- status: created (Exolix exchange made, BTC not yet sent) -> sent -> success,
+-- or failed / send_error. A row left in created or send_error halts the job.
+CREATE TABLE IF NOT EXISTS exolix_swaps (
+    exolix_id TEXT PRIMARY KEY,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    status TEXT NOT NULL,
+    exolix_status TEXT,
+    amount_btc REAL NOT NULL,
+    quoted_xmr REAL NOT NULL,
+    reference_mid REAL NOT NULL,       -- BTC per XMR at create
+    all_in_premium_pct REAL NOT NULL,  -- vs. reference_mid, incl. the assumed BTC network fee
+    deposit_address TEXT NOT NULL,
+    withdrawal_address TEXT NOT NULL,
+    btc_txid TEXT,
+    delivered_xmr REAL,
+    note TEXT
+);
+
+-- 2026-10-21: ground-truth P&L. The fills ledger is gross of network fees, so
+-- proof_report.py also scores the real wallet balances (poller.py, every cycle)
+-- against a baseline plus any money Evan moves in or out (capital_flows).
+CREATE TABLE IF NOT EXISTS wallet_snapshots (
+    polled_at REAL NOT NULL,
+    coin TEXT NOT NULL,                -- display name, e.g. "Bitcoin"
+    balance REAL NOT NULL,
+    unconfirmed REAL NOT NULL,
+    active_swaps INTEGER NOT NULL,     -- in-flight bids + Exolix swaps; balances mid-swap undercount
+    PRIMARY KEY (polled_at, coin)
+);
+
+CREATE TABLE IF NOT EXISTS capital_flows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at REAL NOT NULL,
+    coin TEXT NOT NULL,                -- display name
+    amount REAL NOT NULL,              -- + into the BasicSwap wallets, - out
+    kind TEXT NOT NULL,                -- baseline | deposit | withdrawal
+    note TEXT
+);
 """
+
+
+def insert_exolix_swap(conn: sqlite3.Connection, row: dict) -> None:
+    cols = ", ".join(row)
+    conn.execute(f"INSERT INTO exolix_swaps ({cols}) VALUES ({', '.join('?' * len(row))})", tuple(row.values()))
+    conn.commit()
+
+
+def update_exolix_swap(conn: sqlite3.Connection, exolix_id: str, **fields) -> None:
+    sets = ", ".join(f"{k} = ?" for k in fields)
+    conn.execute(f"UPDATE exolix_swaps SET {sets} WHERE exolix_id = ?", (*fields.values(), exolix_id))
+    conn.commit()
+
+
+def fetch_exolix_swaps(conn: sqlite3.Connection, since: float = 0.0) -> list[dict]:
+    cur = conn.execute("SELECT * FROM exolix_swaps WHERE created_at >= ? ORDER BY created_at", (since,))
+    names = [d[0] for d in cur.description]
+    return [dict(zip(names, r)) for r in cur.fetchall()]
+
+
+def insert_wallet_snapshot(
+    conn: sqlite3.Connection, polled_at: float, balances: dict[str, tuple[float, float]], active_swaps: int
+) -> None:
+    """balances: {display name: (balance, unconfirmed)}."""
+    conn.executemany(
+        "INSERT OR REPLACE INTO wallet_snapshots VALUES (?, ?, ?, ?, ?)",
+        [(polled_at, coin, bal, unc, active_swaps) for coin, (bal, unc) in balances.items()],
+    )
+    conn.commit()
+
+
+def latest_clean_wallet_snapshot(
+    conn: sqlite3.Connection, coins: tuple[str, ...], until: float | None = None
+) -> tuple[float, dict[str, float]] | None:
+    """(polled_at, {coin: balance + unconfirmed}) from the newest snapshot with no swap
+    in flight that has every coin in `coins`, or None."""
+    rows = conn.execute(
+        "SELECT polled_at, coin, balance + unconfirmed FROM wallet_snapshots "
+        "WHERE active_swaps = 0 AND polled_at <= ? ORDER BY polled_at DESC LIMIT 200",
+        (until if until is not None else time.time(),),
+    ).fetchall()
+    by_time: dict[float, dict[str, float]] = {}
+    for t, coin, total in rows:
+        by_time.setdefault(t, {})[coin] = total
+    for t in sorted(by_time, reverse=True):
+        if all(c in by_time[t] for c in coins):
+            return t, by_time[t]
+    return None
+
+
+def insert_capital_flow(
+    conn: sqlite3.Connection, at: float, coin: str, amount: float, kind: str, note: str | None = None
+) -> None:
+    conn.execute(
+        "INSERT INTO capital_flows (at, coin, amount, kind, note) VALUES (?, ?, ?, ?, ?)",
+        (at, coin, amount, kind, note),
+    )
+    conn.commit()
+
+
+def fetch_capital_flows(conn: sqlite3.Connection, until: float | None = None) -> list[dict]:
+    cur = conn.execute(
+        "SELECT * FROM capital_flows WHERE at <= ? ORDER BY at, id",
+        (until if until is not None else time.time(),),
+    )
+    names = [d[0] for d in cur.description]
+    return [dict(zip(names, r)) for r in cur.fetchall()]
 
 
 def connect(db_path: str) -> sqlite3.Connection:

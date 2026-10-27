@@ -1376,3 +1376,178 @@ this is a mid-trial change to the restock leg only, so read pre/post-10-05 resto
 **Deployed 12:58 EDT** (run by Claude on Evan's go-ahead): exactly 2 loops (31643 restock / 31644
 sell). First book-priced cycle: best competitor +0.288%, our restock reposted at ~+0.278% over mid
 (0.00356 BTC, the wallet's available BTC). Sell leg still idle until a restock fill, as expected.
+
+## 2026-10-21: dust-fill fix (min fill size + fee accounting), NOT yet deployed
+
+Week-3 report (`logs/proof_trial_weekly/2026-10-21.txt`) scored PROVISIONAL PESSIMISTIC on a
+-0.43% simple-mean margin over 19 sell fills, almost all from one 0.018 XMR dust fill (-9.81%)
+that paid the full 1,650-sat fixed fee. Evan's call: optimize for a fast answer, not for keeping
+the original trial setup frozen. Two changes, 241/241 tests passing:
+
+- **Live (needs restart):** `--min-bid-amount` / `LiveMakerConfig.min_bid_amount` sends
+  BasicSwap's `amt_bid_min` (field name checked in v0.18.8 `ui/page_offers.py`). An offer
+  smaller than the minimum is posted take-whole. `restart_live_maker_btc.sh` sets
+  `MIN_BID_XMR=0.15`: ~650 sats of swap fees is 0.43% at that size, and every trial fill
+  except the dust one was >= 0.15 XMR, so no real fill would have been lost.
+- **Report:** the fixed fee is split into `SWAP_FEE_SATS` (650, per fill) and
+  `KRAKEN_TRANSFER_SATS` (1,000, pro rata per `KRAKEN_BATCH_XMR`=0.55 restocked, since a Kraken
+  restock is batched, not per fill), and `mean_margin_pct` is now size-weighted by BTC.
+  Rescored by hand from the 10-21 table: size-weighted margin **+0.46%** (simple +0.18%),
+  so it would score PROVISIONAL BASE, not PESSIMISTIC. The 0.8% OPTIMISTIC bar is not met.
+  Not re-run against the DB this session: this shell got "Permission denied" on
+  `/Volumes/Storage` (where `~/coinswaps` points), while launchd jobs could still read it.
+
+## 2026-10-21, later: min-bid restart done; sell premium 1.8% -> 2.1% (script only)
+
+Evan restarted at 12:44; verified 2 `live_maker` loops, sell leg running `--min-bid-amount 0.15`.
+Correction to the entry above: with the new margin math the report would score INCONCLUSIVE,
+not BASE, because sell uptime (32%) is checked before BASE, and cumulative uptime can't reach
+50% by 10-28. The trial is stock-constrained (~20 fills per week of uptime), so on Evan's
+go-ahead `SELL_PREMIUM` is now 0.021 in `restart_live_maker_btc.sh` (also raises the restock
+leg's `--restock-expected-sell-premium-pct`). Takes effect on Evan's next restart. The
+uptime-gate change to `proof_report.py` was proposed and NOT made.
+
+## 2026-10-21, afternoon: Exolix auto-restock built (dry run); node API hung since 10:58
+
+**Exolix auto-restock** (`strategy/exolix_restock.py`, on Evan's explicit go-ahead after
+two auto-mode classifier blocks; finished in manual-approval mode). Every 15 min via
+`com.market_maker.exolix-restock` (installed and loaded 14:05, **dry run**: no `--live`).
+When sell stock above the 0.385 reserve is under 0.2 XMR, it refills to reserve + 0.55 with a
+float-rate Exolix BTC->XMR swap. Caps: one swap in flight, 0.004 BTC/swap, 2/day, 0.015 BTC/week,
+skip above +1.0% all-in vs. Kraken mid, 60 min cooldown after a success. It records the row
+before sending BTC, and checks Exolix echoed our XMR `main_address` and gave a plausible BTC
+deposit address. Halts (`~/coinswaps/exolix_restock.halt` + notification) on any row left in
+`created`/`send_error`, overdue/refunded, >4h unresolved, or <97% of quoted XMR delivered.
+New: `api_client.get_wallet()`/`withdraw()` (BasicSwap v0.18.8 `/json/wallets/btc/withdraw`),
+`exolix_swaps` table, an Exolix section in `proof_report` (completed swaps count in net sats).
+Exolix facts checked live: no API key needed to create a swap; float beat fixed by ~1%;
+Cloudflare blocks curl's and urllib's default User-Agent; terms bar only sanctioned
+users/jurisdictions, but a deposit flagged as suspicious can be held for documents.
+265/265 tests.
+
+**Node API hung**: last good poll 10:53; the 10:58 poll never returned and every call since
+11:19 gets "Connection refused" while `basicswap-run` (PID 63568, up since 09-30) still holds
+127.0.0.1:12700. Both live_maker restarts (12:44 min-bid, 13:42 premium 2.1%) are running but
+can't reach the node, so neither change has been posted. The trial has been effectively offline
+since ~11:00. Needs Evan: restart `basicswap-run`, then `restart_live_maker_btc.sh`.
+Exolix job stays dry-run until a dry-run cycle against a working node reads sane numbers.
+
+## 2026-10-21, 15:45-16:00: node back up, Exolix restock LIVE, real wallet P&L tracking
+
+**Restart.** The post-reboot start hit a new failure: the node read a stale `particl/.cookie`
+left by the unclean shutdown a moment before particld rewrote it, so every PART RPC call failed
+auth (`incorrect password attempt` in `particl/debug.log`). A second `basicswap-run` was also
+launched by accident; it tried to stop the running daemons, failed, and exited without harm.
+Fixed with one clean `kill -INT` + single restart (API up 15:45:55). Added to the
+framework `CLAUDE.md` checklist (3b). Both live_maker loops were already running with the
+10-21 settings (sell leg 2.1%, min bid 0.15). The restock leg reposted at 15:48 (book pricing,
++0.49% vs. best competitor). The sell leg posts nothing: 0.0499 XMR above the 0.385 reserve is
+under one 0.05 step, so the trial is waiting on XMR.
+
+**Exolix restock live** on Evan's go-ahead after a sane dry run (15:50: 0.00365 BTC -> 0.5018
+XMR, +0.64% all-in, mid 0.007246). `--live` added to both plist copies, job reloaded. First live
+run (15:51:48) skipped: +1.05% > the +1.00% cap. It retries every 15 min.
+
+**Real wallet P&L (Evan: "make sure we're tracking what we need to determine profitability").**
+The fills ledger is gross of network fees, and nothing tracked actual balances. Added:
+`wallet_snapshots` (poller.py, every cycle, with an in-flight swap count; mid-swap snapshots
+are ignored), `capital_flows` + `strategy/capital_flows.py` CLI (baseline/deposit/withdrawal),
+and an "Actual wallet P&L" line + gap in `proof_report.py` (the weekly job picks it up).
+Baseline seeded at the trial start: 0.00388973 BTC (after the 09-28 top-up) and 0.98496932
+XMR (live_maker log, 09-30 10:27:44). 272/272 tests.
+
+**First reading (15:56):** fill-based net **+7,876 sats**, actual wallet **-4,389 sats**
+(BTC +0.00393377, XMR -0.55004416, at today's price). The ~12,300-sat gap over 31 fills
+(~400 sats/fill) is on-chain swap fees. So after fees the trial is currently slightly
+negative vs. never having traded. Still excludes the ~13k-sat 09-28 seed cost (pre-baseline).
+
+## 2026-10-22, 14:00: check-in — Exolix restock working (2 swaps); stale sell offer picked off in XMR spike
+
+**Exolix restock works.** Two live swaps completed with no halt: `cbcb726ae1e3a1` (10-21 16:06,
+0.00366301 BTC -> 0.49979300 XMR, 15 min) and `a7b2031bdca3d0` (10-22 02:52, 0.00398125 BTC ->
+0.50377760 XMR, 60 min). Both delivered >= 99.6% of quote; mean all-in +0.40% vs. mid. The job
+has run cleanly every 15 min since, correctly idling (0.249 XMR above reserve >= 0.2 trigger).
+
+**Maker fills since restart:** 2 sell fills: 10-22 02:14 (0.5 XMR, **-2.75% vs. mid at fill,
+margin -4.26%**) and 04:09 (0.304 XMR, +1.80%, margin -0.03%). The 02:14 fill came during a
+~5% XMR/BTC spike: the volatility kill-switch tripped from 02:04 on but, by design, "leaves any
+existing live offer untouched", so the stale ask stayed up and was taken below market. Exolix
+then bought the XMR back at the new, higher price (02:52). Open question for Evan: should the
+kill-switch revoke the live offer instead of only pausing reposts?
+
+proof_report at 14:00: 21 sell fills, size-weighted margin +0.09%, fill-based net +58 sats,
+**actual wallet P&L -13,252 sats** (was -4,389 at 10-21 15:56). Verdict PROVISIONAL
+INCONCLUSIVE (3.2/4 weeks, sell uptime 34%).
+
+## 2026-10-22, later: revoke any live offer that's no longer profitable (built, NOT deployed)
+
+Evan's call: "cancel any offer once we determine it isn't profitable." New
+`live_maker._revoke_if_unprofitable`, run at the top of every `run_cycle` (after the
+source-disagreement gate, before the kill-switch/cooldown/in-flight/reserve early returns), so
+no pause can leave an underwater offer live again. Floor: sell leg `--min-live-edge-pct`
+(new, default 0; `restart_live_maker_btc.sh` sets `MIN_LIVE_EDGE=0.01`, roughly break-even at the
+smallest accepted 0.15 XMR fill: ~0.6% swap fees + ~0.4% Exolix restock); restock leg
+`-restock_max_premium_pct`. Uses `refuse_if_negotiating=True`, so a bid already mid-negotiation
+can't be yanked. 4 new tests, 275/275 passing. **Takes effect on the next
+`restart_live_maker_btc.sh` run** (needs Evan's go-ahead).
+
+## 2026-10-22, 14:10: DEPLOYED — unprofitable-offer revoke + 30s Kraken guard
+
+Evan asked whether to move faster than the 5-min cadence. Answer: split it. Full pricing/repost
+cycle stays at 5 min (repost churn, and the kill-switch thresholds are calibrated on 5-min
+samples). New `live_maker.guard_check` runs every `--guard-interval-seconds` (default 30) between
+full cycles: Kraken XMR/BTC best bid/ask mid only (new `external_rates.get_kraken_mid`; CoinGecko
+refreshes only ~1/min), revoke-only via `_revoke_if_unprofitable`, never posts, never feeds the
+VolatilityMonitor. Checked first: CoinGecko vs. Kraken over 14 days (4,001 samples) averaged
+0.22% apart, >1% only 0.32% of the time, so the guard won't fight the main cycle. Live sanity
+read at 14:05: Kraken mid 0.0075565 vs. CoinGecko 0.0075612. 279/279 tests.
+
+Restarted with `restart_live_maker_btc.sh` at 14:10 on Evan's go-ahead (no swap in flight,
+every received bid terminal): exactly 2 `live_maker` processes; sell leg running
+`--min-live-edge-pct 0.01`, both on the default 30s guard. The guard is silent unless it revokes
+or a Kraken read fails.
+
+**14:13 follow-up fix + redeploy.** In its first 30s (14:10:54) the guard revoked the restock
+offer: quoted at exactly the -0.50% cap vs. CoinGecko, it read -0.528% vs. Kraken. That's
+source bias, not a market move, and it would have repeated every cycle whenever Kraken's
+XMR-per-BTC sits above CoinGecko's. Fixed: `guard_anchor` records (the mid the full cycle
+priced off, Kraken mid right after), and `guard_check` applies Kraken's move *since then* to the
+cycle's mid, so a steady gap cancels out. It falls back to raw Kraken only if the cycle never got
+a trusted mid. New `VolatilityMonitor.latest()`. 282/282 tests. Restarted 14:13 (no swap in
+flight), 2 processes.
+
+**14:15 second fix + redeploy.** The anchor worked, but the guard still revoked the reposted
+restock offer at 14:13:37 on a real ~0.05% Kraken tick. Book pricing quotes the restock leg
+at exactly its -0.50% cap, and the floor had been set equal to that cap. The cap is pricing
+policy, not break-even, so the restock floor is now -(restock_max_premium_pct +
+reprice_threshold_pct) = -1.0%, the same drift the 5-min cycle already tolerates. Buying at
+1% over mid still clears the round trip against the +2.1% sell premium. The sell floor is
+unchanged at +1.0% (quote +2.1%). 282/282 tests. Restarted at 14:15 with no swap in flight,
+2 processes.
+
+## 2026-10-23: first live Exolix restocks completed
+
+- **Swap 1:** `cbcb726ae1e3a1`, 10-21 16:06. 0.00366301 BTC -> 0.49979300 XMR (quoted
+  0.50171539, so 99.6% delivered, above the 97% halt line), +0.64% all-in. Completed 16:21.
+- **Swap 2:** `a7b2031bdca3d0`, 10-22 02:52. 0.00398125 BTC -> 0.50377760 XMR, +0.17% all-in.
+  Completed 03:52.
+- **Result:** the report's Exolix section shows 0.00764426 BTC -> 1.00357060 XMR, +0.40% mean
+  all-in. No halt file. As of 10-23 12:40 the job logs `none` (0.60 XMR above the reserve).
+- **Proof report, 10-23:**
+  - Verdict: PROVISIONAL INCONCLUSIVE.
+  - Sell fills: 21 (6.37/wk), size-weighted margin +0.09%.
+  - Restock-leg fills: 13.
+  - Net position (gross): +5,222 sats.
+  - **Actual wallet P&L: -8,364 sats**. BTC -0.00008364, XMR +0.00000031: XMR is back at
+    baseline, so the whole result is BTC. The gap to the gross figure is -13,586 sats.
+
+## 2026-10-23, 13:22: check-in, first day of the floor revoke + 30s guard
+
+Healthy: 2 `live_maker` loops up since the 10-22 14:15 deploy, node up since 10-21, no Exolix halt.
+8 floor revokes, all real moves (no source-gap flapping after the 14:15 fix). 7 were restock
+offers as XMR rallied (mid 133 -> 136.5 XMR/BTC, revoked at -1.0% to -1.2%). 1 was the sell
+offer at 00:46:27, which the guard pulled mid-kill-switch at +0.978% vs. mid: the 10-22 02:14
+failure mode caught in practice. One Kraken 502 (06:06) was skipped cleanly. No new sell fills
+since 10-22 04:09. One restock fill took XMR to the 0.985 target, so the restock leg stood down
+(22:15) and Exolix has idled. proof_report: wallet P&L -8,364 sats (was -13,252), fill-based
++5,223 sats, still PROVISIONAL INCONCLUSIVE (3.3/4 weeks, sell uptime 36%).

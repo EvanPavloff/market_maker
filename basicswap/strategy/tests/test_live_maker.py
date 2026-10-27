@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 
 from .. import storage
 from ..api_client import BasicSwapAPIError
-from ..external_rates import ReferenceRate
+from ..external_rates import ExternalRateError, ReferenceRate
 from ..live_maker import (
     AmbiguousLiveOffersError,
     InsufficientBalanceError,
@@ -13,6 +13,8 @@ from ..live_maker import (
     _resolve_amount_from,
     SATS_PER_BTC,
     decide_and_act,
+    guard_anchor,
+    guard_check,
     run_cycle,
 )
 from ..economics import restock_half_spread_pct
@@ -59,11 +61,25 @@ class DecideAndActTests(unittest.TestCase):
         # target rate = 150.0 * 1.0066
         self.assertEqual(args[3], "150.99000000")
         self.assertEqual(kwargs["automation_strat_id"], 1)
+        self.assertIsNone(kwargs["min_bid_amount"])
         self.client.revoke_offer.assert_not_called()
 
         events = storage.fetch_live_quote_events(self.conn, "Bitcoin", "Monero", side="ask")
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["offer_id"], "aaaa")
+
+    def test_min_bid_amount_is_passed_and_capped_at_offer_size(self):
+        self.client.get_sent_offers.return_value = []
+        self.client.post_offer.return_value = "aaaa"
+
+        decide_and_act(self.client, self.conn, _cfg(amount_from=0.55, min_bid_amount=0.25),
+                       reference_mid=150.0, now=1000.0)
+        self.assertEqual(self.client.post_offer.call_args.kwargs["min_bid_amount"], "0.25000000")
+
+        # An offer smaller than the minimum is posted take-whole.
+        decide_and_act(self.client, self.conn, _cfg(amount_from=0.15, min_bid_amount=0.25),
+                       reference_mid=150.0, now=1000.0)
+        self.assertEqual(self.client.post_offer.call_args.kwargs["min_bid_amount"], "0.15000000")
 
     def test_fresh_offer_with_small_drift_does_nothing(self):
         self.client.get_sent_offers.return_value = [
@@ -362,7 +378,23 @@ class RunCycleKillSwitchTests(unittest.TestCase):
         self.client.post_offer.assert_called_once()
 
     @patch("strategy.live_maker.external_rates.get_reference_rate")
-    def test_kill_switch_leaves_an_existing_live_offer_untouched(self, mock_rate):
+    def test_kill_switch_leaves_a_still_profitable_live_offer_untouched(self, mock_rate):
+        self.client.get_sent_offers.return_value = [
+            {"offer_id": "aaaa", "rate": "156.00000000", "created_at": time.time(),
+             "is_expired": False, "is_revoked": False}
+        ]
+        monitor = VolatilityMonitor(window_seconds=900)
+        monitor.add(time.time() - 60, 150.0)
+        mock_rate.return_value = _rate(coingecko_rate=154.0)
+
+        run_cycle(self.client, self.conn, _cfg(min_live_edge_pct=0.01), monitor)
+
+        self.client.revoke_offer.assert_not_called()
+        self.client.post_offer.assert_not_called()
+
+    @patch("strategy.live_maker.external_rates.get_reference_rate")
+    def test_kill_switch_revokes_a_live_offer_the_move_left_underwater(self, mock_rate):
+        # 2026-10-22 02:14: the pause left a below-mid ask up until it was taken.
         self.client.get_sent_offers.return_value = [
             {"offer_id": "aaaa", "rate": "150.99000000", "created_at": time.time(),
              "is_expired": False, "is_revoked": False}
@@ -373,8 +405,48 @@ class RunCycleKillSwitchTests(unittest.TestCase):
 
         run_cycle(self.client, self.conn, _cfg(), monitor)
 
-        self.client.revoke_offer.assert_not_called()
+        self.client.revoke_offer.assert_called_once_with("aaaa", refuse_if_negotiating=True)
         self.client.post_offer.assert_not_called()
+
+    @patch("strategy.live_maker.external_rates.get_reference_rate")
+    def test_cooldown_revokes_an_offer_under_the_min_live_edge(self, mock_rate):
+        # +0.5% over mid clears 0 but not a 1% floor.
+        self.client.get_sent_offers.return_value = [
+            {"offer_id": "aaaa", "rate": "150.75000000", "created_at": time.time(),
+             "is_expired": False, "is_revoked": False}
+        ]
+        monitor = VolatilityMonitor(window_seconds=900)
+        monitor.last_trip_at = time.time() - 60
+        mock_rate.return_value = _rate(coingecko_rate=150.0)
+
+        run_cycle(self.client, self.conn, _cfg(min_live_edge_pct=0.01), monitor)
+
+        self.client.revoke_offer.assert_called_once_with("aaaa", refuse_if_negotiating=True)
+        self.client.post_offer.assert_not_called()
+
+    @patch("strategy.live_maker.external_rates.get_reference_rate")
+    def test_restock_leg_floor_is_its_cap_plus_reprice_tolerance(self, mock_rate):
+        # Restock offers sit below mid by design, often right at the cap; the floor
+        # is -(restock_max_premium_pct + reprice_threshold_pct) = -1.0% here.
+        self.client.get_sent_offers.return_value = [
+            {"offer_id": "aaaa", "rate": "149.40000000", "created_at": time.time(),
+             "is_expired": False, "is_revoked": False}
+        ]
+        monitor = VolatilityMonitor(window_seconds=900)
+        monitor.last_trip_at = time.time() - 60
+        cfg = _cfg(objective="btc", restock_expected_sell_premium_pct=0.021, restock_max_premium_pct=0.005)
+        mock_rate.return_value = _rate(coingecko_rate=150.0)  # -0.4%: within the cap
+
+        run_cycle(self.client, self.conn, cfg, monitor)
+        self.client.revoke_offer.assert_not_called()
+
+        mock_rate.return_value = _rate(coingecko_rate=150.3)  # ~-0.6%: past the cap, inside the floor
+        run_cycle(self.client, self.conn, cfg, monitor)
+        self.client.revoke_offer.assert_not_called()
+
+        mock_rate.return_value = _rate(coingecko_rate=151.2)  # ~-1.2%: past the floor
+        run_cycle(self.client, self.conn, cfg, monitor)
+        self.client.revoke_offer.assert_called_once_with("aaaa", refuse_if_negotiating=True)
 
 
 class RunCycleKillSwitchHysteresisTests(unittest.TestCase):
@@ -966,6 +1038,60 @@ class InFlightSentBidTests(unittest.TestCase):
             amount_step=0.05, max_amount_from=0.55,
         )
         self.assertAlmostEqual(_resolve_amount_from(client, cfg), 0.3)
+
+
+class GuardCheckTests(unittest.TestCase):
+    """2026-10-22: the 30s revoke-only check between full cycles."""
+
+    def setUp(self):
+        self.client = MagicMock()
+        self.client.get_sent_offers.return_value = [
+            {"offer_id": "aaaa", "rate": "151.50000000", "created_at": time.time(),
+             "is_expired": False, "is_revoked": False}
+        ]
+
+    @patch("strategy.live_maker.external_rates.get_kraken_mid", return_value=150.0)
+    def test_leaves_an_offer_above_its_floor(self, _):
+        self.assertFalse(guard_check(self.client, _cfg(min_live_edge_pct=0.01)))
+        self.client.revoke_offer.assert_not_called()
+
+    @patch("strategy.live_maker.external_rates.get_kraken_mid", return_value=150.5)
+    def test_revokes_an_offer_below_its_floor_and_never_posts(self, _):
+        self.assertTrue(guard_check(self.client, _cfg(min_live_edge_pct=0.01)))
+        self.client.revoke_offer.assert_called_once_with("aaaa", refuse_if_negotiating=True)
+        self.client.post_offer.assert_not_called()
+
+    @patch("strategy.live_maker.external_rates.get_kraken_mid", side_effect=ExternalRateError("down"))
+    def test_rate_failure_skips_without_touching_the_offer(self, _):
+        self.assertFalse(guard_check(self.client, _cfg(min_live_edge_pct=0.01)))
+        self.client.get_sent_offers.assert_not_called()
+        self.client.revoke_offer.assert_not_called()
+
+    @patch("strategy.live_maker.external_rates.get_kraken_mid", return_value=150.5)
+    def test_anchor_cancels_a_steady_source_gap(self, _):
+        # Cycle priced off 150.0 while Kraken read 150.5; Kraken hasn't moved since.
+        self.assertFalse(guard_check(self.client, _cfg(min_live_edge_pct=0.01), anchor=(150.0, 150.5)))
+        self.client.revoke_offer.assert_not_called()
+
+    @patch("strategy.live_maker.external_rates.get_kraken_mid", return_value=152.0)
+    def test_anchor_still_catches_a_real_move(self, _):
+        # Kraken +1% since the cycle: 151.5 is now ~-0.5% vs. the moved mid.
+        self.assertTrue(guard_check(self.client, _cfg(min_live_edge_pct=0.01), anchor=(150.0, 150.5)))
+        self.client.revoke_offer.assert_called_once_with("aaaa", refuse_if_negotiating=True)
+
+    @patch("strategy.live_maker.external_rates.get_kraken_mid", return_value=150.5)
+    def test_guard_anchor_only_from_a_sample_this_cycle_added(self, _):
+        monitor = VolatilityMonitor(window_seconds=900)
+        self.assertIsNone(guard_anchor(_cfg(), monitor, cycle_started=1000.0))
+        monitor.add(990.0, 150.0)  # previous cycle's sample
+        self.assertIsNone(guard_anchor(_cfg(), monitor, cycle_started=1000.0))
+        monitor.add(1001.0, 150.0)
+        self.assertEqual(guard_anchor(_cfg(), monitor, cycle_started=1000.0), (150.0, 150.5))
+
+    @patch("strategy.live_maker.external_rates.get_kraken_mid", return_value=160.0)
+    def test_revoke_refused_mid_negotiation_is_logged_not_raised(self, _):
+        self.client.revoke_offer.side_effect = BasicSwapAPIError("negotiating")
+        self.assertFalse(guard_check(self.client, _cfg()))
 
 
 if __name__ == "__main__":

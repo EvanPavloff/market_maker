@@ -29,7 +29,8 @@ Safety notes:
   - Volatility kill-switch (market_maker/next_steps.md #1, built 2026-09-18):
     run_cycle tracks a rolling window of reference-mid samples via
     volatility.VolatilityMonitor and skips posting/reposting for a cycle
-    (existing live offer left untouched) if the window's (max-min)/mean move
+    (existing live offer left up, unless _revoke_if_unprofitable pulls it —
+    2026-10-22) if the window's (max-min)/mean move
     exceeds cfg.kill_switch_volatility_pct — see volatility.py for the
     real-data calibration behind the default. This is the one control decide_and_act's
     own drift-based repricing doesn't cover: reprice chases a moved price
@@ -200,6 +201,11 @@ class LiveMakerConfig:
     # 2026-09-30: cap on a dynamic (reserve-sized) offer, applied before amount_step.
     # Keeps the sell leg's offer size fixed while restock fills grow the balance.
     max_amount_from: float | None = None
+    # 2026-10-21: smallest partial fill to accept (coin_from units). Each swap
+    # pays ~650 sats of BTC network fees whatever its size, so a dust fill (the
+    # 10-18 0.018 XMR sell) loses money at any premium. An offer smaller than
+    # this is posted take-whole (min = its own size).
+    min_bid_amount: float | None = None
     # 2026-10-01: restock leg pricing. "cost" = economics.restock_half_spread_pct
     # alone (always above mid). "book" = just inside the best competing BasicSwap
     # offer, never paying more than restock_max_premium_pct over mid for coin_to
@@ -207,6 +213,14 @@ class LiveMakerConfig:
     restock_pricing: str = "cost"
     restock_max_premium_pct: float = 0.005
     restock_book_improve_pct: float = 0.0001
+    # 2026-10-22: smallest premium over the current mid a live non-restock offer may
+    # keep before it's revoked (_revoke_if_unprofitable). Checked every cycle,
+    # including kill-switch/cooldown cycles that otherwise leave the offer alone.
+    # The restock leg's floor is -restock_max_premium_pct instead.
+    min_live_edge_pct: float = 0.0
+    # 2026-10-22: between full cycles, re-check the live offer against Kraken's mid
+    # this often (guard_check, revoke-only). <= 0 disables it.
+    guard_interval_seconds: float = 30.0
 
     def __post_init__(self):
         sizings = [self.amount_from, self.reserve_usd, self.reserve_coin]
@@ -367,6 +381,10 @@ def decide_and_act(
                 f"lower --amount-from to keep quoting."
             )
 
+    min_bid_str = (
+        None if cfg.min_bid_amount is None else f"{min(cfg.min_bid_amount, cfg.amount_from):.8f}"
+    )
+
     def _post_new_quote() -> str:
         return client.post_offer(
             cfg.coin_from,
@@ -376,6 +394,7 @@ def decide_and_act(
             lock_hours=cfg.lock_hours,
             valid_hours=cfg.valid_hours,
             automation_strat_id=cfg.automation_strat_id,
+            min_bid_amount=min_bid_str,
         )
 
     if real_live_offer is None:
@@ -654,6 +673,73 @@ def _btc_objective_plan(
     return amount, h, best_rate
 
 
+def _revoke_if_unprofitable(client: BasicSwapClient, cfg: LiveMakerConfig, reference_mid: float) -> bool:
+    """2026-10-22 (Evan: "cancel any offer once we determine it isn't profitable").
+    The 10-22 02:14 sell fill went 2.75% below mid: XMR jumped ~5%, the kill-switch
+    paused repricing from 01:49 and left the old ask up for six cycles until it was
+    taken. Runs before every pause, so a pause never leaves an underwater offer live.
+    True if an offer was revoked. Restock floor: the max-premium cap plus the
+    cycle's own reprice tolerance. The cap alone is where book pricing usually
+    quotes, so any adverse tick revoked it (14:13 redeploy); buying at cap+0.5%
+    still clears the round trip against the sell premium."""
+    if cfg.is_restock_leg:
+        floor = -(cfg.restock_max_premium_pct + cfg.reprice_threshold_pct)
+    else:
+        floor = cfg.min_live_edge_pct
+    try:
+        live = _find_own_live_offer(client, cfg.coin_from, cfg.coin_to)
+        if live is None:
+            return False
+        premium = float(live["rate"]) / reference_mid - 1
+        if float(live["rate"]) >= reference_mid * (1 + floor) * (1 - 1e-9):
+            return False
+        client.revoke_offer(live["offer_id"], refuse_if_negotiating=True)
+    except (BasicSwapAPIError, AmbiguousLiveOffersError) as e:
+        log.warning("%s/%s %s: couldn't check/revoke an unprofitable live offer: %s",
+                    cfg.coin_from, cfg.coin_to, cfg.side, e)
+        return False
+    log.warning(
+        "%s/%s %s: revoked live offer %s @ %s: %+.3f%% vs. mid %.8f is below the %+.3f%% floor",
+        cfg.coin_from, cfg.coin_to, cfg.side, live["offer_id"], live["rate"],
+        premium * 100, reference_mid, floor * 100,
+    )
+    return True
+
+
+def guard_anchor(
+    cfg: LiveMakerConfig, monitor: VolatilityMonitor, cycle_started: float
+) -> tuple[float, float] | None:
+    """(the mid the full cycle just priced off, Kraken's mid right now), or None if
+    that cycle never got a trusted mid (it skips before adding a sample)."""
+    latest = monitor.latest()
+    if latest is None or latest[0] < cycle_started:
+        return None
+    try:
+        return latest[1], external_rates.get_kraken_mid(cfg.coin_from, cfg.coin_to)
+    except ExternalRateError as e:
+        log.warning("%s/%s %s: no guard anchor this cycle: %s", cfg.coin_from, cfg.coin_to, cfg.side, e)
+        return None
+
+
+def guard_check(
+    client: BasicSwapClient, cfg: LiveMakerConfig, anchor: tuple[float, float] | None = None
+) -> bool:
+    """2026-10-22: the fast check between full cycles, revoke-only: never posts,
+    never feeds the VolatilityMonitor (its thresholds were calibrated on 5-min
+    samples). With an anchor it applies Kraken's move since the full cycle to the
+    mid that cycle priced off, so a steady CoinGecko/Kraken gap can't make it
+    fight the cycle (first deploy, 14:10: it revoked a restock offer quoted at
+    exactly its cap within 30s). Without one, Kraken's mid as-is. Any failure
+    just skips this check."""
+    try:
+        kraken_mid = external_rates.get_kraken_mid(cfg.coin_from, cfg.coin_to)
+    except ExternalRateError as e:
+        log.warning("%s/%s %s: guard check skipped: %s", cfg.coin_from, cfg.coin_to, cfg.side, e)
+        return False
+    mid = kraken_mid if anchor is None else anchor[0] * kraken_mid / anchor[1]
+    return _revoke_if_unprofitable(client, cfg, mid)
+
+
 def _pause_for_in_flight_swaps(client: BasicSwapClient, cfg: LiveMakerConfig, in_flight: list[dict]) -> None:
     ids = ", ".join(f"{b.get('bid_id', '?')[:16]} ({b.get('bid_state')})" for b in in_flight)
     try:
@@ -698,6 +784,8 @@ def run_cycle(
         )
         return
 
+    _revoke_if_unprofitable(client, cfg, reference_mid)
+
     now = time.time()
     volatility_monitor.add(now, reference_mid)
     vol_pct = volatility_monitor.volatility_pct(cfg.kill_switch_window_minutes * 60)
@@ -718,8 +806,8 @@ def run_cycle(
     if trips:
         volatility_monitor.last_trip_at = now
         log.warning(
-            "%s/%s %s: volatility kill-switch active (%s) — skipping post/reprice this cycle, "
-            "any existing live offer is left untouched.",
+            "%s/%s %s: volatility kill-switch active (%s) — skipping post/reprice this cycle; "
+            "a live offer is left up only while it clears its profitability floor.",
             cfg.coin_from, cfg.coin_to, cfg.side, "; ".join(trips),
         )
         return
@@ -727,8 +815,8 @@ def run_cycle(
     if volatility_monitor.cooling_down(now, cooldown_seconds):
         log.warning(
             "%s/%s %s: volatility kill-switch cooling down (last tripped %.0fs ago, %.0fm "
-            "cooldown) — skipping post/reprice this cycle, any existing live offer is left "
-            "untouched.",
+            "cooldown) — skipping post/reprice this cycle; a live offer is left up only while "
+            "it clears its profitability floor.",
             cfg.coin_from, cfg.coin_to, cfg.side, now - volatility_monitor.last_trip_at,
             cfg.kill_switch_cooldown_minutes,
         )
@@ -806,6 +894,8 @@ def run(cfg: LiveMakerConfig, loop: bool) -> None:
             sizing += f" amount_step={cfg.amount_step:.8f}"
     if cfg.max_amount_from is not None and cfg.amount_from is None:
         sizing += f" max_amount_from={cfg.max_amount_from:.8f}"
+    if cfg.min_bid_amount is not None:
+        sizing += f" min_bid_amount={cfg.min_bid_amount:.8f}"
     log.info(
         "LIVE market-making: %s/%s %s, %s half_spread_floor_pct=%.4f "
         "assumed_fill_hours=%.2f reprice_threshold_pct=%.4f offer_valid_hours=%.2f "
@@ -833,9 +923,18 @@ def run(cfg: LiveMakerConfig, loop: bool) -> None:
         )
 
     try:
+        cycle_started = time.time()
         run_cycle(client, conn, cfg, volatility_monitor)
         while loop:
-            time.sleep(config.poll_interval_seconds)
+            next_cycle = cycle_started + config.poll_interval_seconds
+            anchor = None
+            if cfg.guard_interval_seconds > 0:
+                anchor = guard_anchor(cfg, volatility_monitor, cycle_started)
+            while cfg.guard_interval_seconds > 0 and time.time() + cfg.guard_interval_seconds < next_cycle:
+                time.sleep(cfg.guard_interval_seconds)
+                guard_check(client, cfg, anchor)
+            time.sleep(max(0.0, next_cycle - time.time()))
+            cycle_started = time.time()
             run_cycle(client, conn, cfg, volatility_monitor)
     except AmbiguousLiveOffersError as e:
         log.error(
@@ -913,6 +1012,21 @@ def main(argv: list[str] | None = None) -> int:
         "--restock-max-premium-pct", type=float, default=0.005,
         help="--restock-pricing book: the most to pay over mid for coin_to. Must stay below "
         "--restock-expected-sell-premium-pct so a round trip nets positive before fees.",
+    )
+    parser.add_argument(
+        "--min-bid-amount", type=float, default=None,
+        help="smallest partial fill to accept, in coin_from units (BasicSwap's amt_bid_min). "
+        "An offer smaller than this is posted take-whole. Default None: BasicSwap's own minimum.",
+    )
+    parser.add_argument(
+        "--min-live-edge-pct", type=float, default=0.0,
+        help="revoke a live (non-restock) offer whose premium over the current mid falls below "
+        "this, checked every cycle including kill-switch pauses. Default 0: never sit below mid.",
+    )
+    parser.add_argument(
+        "--guard-interval-seconds", type=float, default=30.0,
+        help="between full cycles, re-check the live offer against Kraken's mid this often and "
+        "revoke it if it's below its floor (never posts). <= 0 disables.",
     )
     parser.add_argument(
         "--amount-step", type=float, default=None,
@@ -1022,6 +1136,9 @@ def main(argv: list[str] | None = None) -> int:
         reserve_coin=args.reserve_coin,
         amount_step=args.amount_step,
         max_amount_from=args.max_amount_from,
+        min_bid_amount=args.min_bid_amount,
+        min_live_edge_pct=args.min_live_edge_pct,
+        guard_interval_seconds=args.guard_interval_seconds,
         objective=args.objective,
         restock_target_to=args.restock_target_coin_to,
         restock_expected_sell_premium_pct=args.restock_expected_sell_premium_pct,

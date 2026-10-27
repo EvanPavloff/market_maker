@@ -1633,6 +1633,23 @@ optimistic, so read it as a ceiling.
 `python3 -m strategy.proof_report` from `basicswap/`. The fill-ledger launchd job
 does the sync hourly once it's installed.
 
+**2026-10-21 changes (mid-trial, on purpose):** sell offers now carry a 0.15 XMR minimum fill
+(`--min-bid-amount`), and the report charges the Kraken transfer per 0.55 XMR batch and
+size-weights the margin. See `basicswap/project_status.md` 2026-10-21.
+
+**2026-10-21, after the reboot: Exolix restock live + real P&L.** `strategy/exolix_restock.py`
+runs live every 15 min (Evan's go-ahead after a sane dry run). It refills the sell leg when
+stock above the 0.385 reserve drops under 0.2 XMR, capped at +1.0% all-in vs. Kraken mid. By
+10-23 it had completed 2 swaps: 0.00764 BTC -> 1.00357 XMR, +0.40% mean all-in. That's
+cheaper than the +0.66% median the restock study measured, and no halt so far.
+**Score the trial on the report's "Actual wallet P&L" line, not "Net position".** The fills
+ledger is gross of network fees. The new line uses real wallet balances (`wallet_snapshots`,
+written by the poller) less a baseline and recorded deposits/withdrawals
+(`strategy/capital_flows.py`). Readings: 10-21 -4,389 sats (vs. +7,876 gross), 10-23
+-8,364 sats (vs. +5,222 gross), i.e. ~400 sats of fees per fill. On 10-23 the size-weighted
+sell margin was +0.09% over 21 fills (was +0.46% over 19). Still open: the node-health alert,
+and Evan's call on judging by fill count instead of uptime.
+
 **Restock side (added 2026-10-02):** `python3 -m venues.restock_cost` from
 `market_maker/` shows the all-in cost to buy 0.5 XMR on each venue we poll
 (BasicSwap, Bisq, Eigen ASB, Exolix, ChangeNOW) against Kraken. If a no-KYC

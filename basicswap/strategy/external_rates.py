@@ -108,6 +108,29 @@ def _kraken_ticker_rate(pair: str, timeout: float) -> float:
     return float(ticker["c"][0])  # last trade closed price
 
 
+def get_kraken_mid(coin_from: str, coin_to: str, timeout: float = 5.0) -> float:
+    """2026-10-22: coin_to-per-coin_from from Kraken's live best bid/ask midpoint
+    (not the last trade, which can be minutes old on XMR/BTC). One cheap call,
+    for live_maker's 30s offer guard; CoinGecko only refreshes about once a
+    minute. Raises ExternalRateError on any failure or unmapped pair."""
+    coin_from, coin_to = coin_from.lower(), coin_to.lower()
+    pair = _KRAKEN_PAIRS.get((coin_from, coin_to))
+    inverted = pair is None
+    if inverted:
+        pair = _KRAKEN_PAIRS.get((coin_to, coin_from))
+    if pair is None:
+        raise ExternalRateError(f"no Kraken pair configured for {coin_from}/{coin_to}")
+    try:
+        data = _get_json("https://api.kraken.com/0/public/Ticker?" + urllib.parse.urlencode({"pair": pair}), timeout)
+        ticker = next(iter(data["result"].values()))
+        mid = (float(ticker["a"][0]) + float(ticker["b"][0])) / 2
+    except Exception as e:  # noqa: BLE001
+        raise ExternalRateError(f"Kraken mid for {pair} failed: {e}") from e
+    if not mid > 0:
+        raise ExternalRateError(f"Kraken mid for {pair} not positive: {mid}")
+    return 1.0 / mid if inverted else mid
+
+
 @dataclass
 class ReferenceRate:
     coin_from: str

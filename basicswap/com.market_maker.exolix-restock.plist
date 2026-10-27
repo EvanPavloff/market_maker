@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Added 2026-10-21. Automated BTC->XMR restock through Exolix for the proof
+  trial's sell leg, every 15 minutes. See strategy/exolix_restock.py for the
+  trigger, caps and halt conditions. SENDS REAL BTC when "live" is in
+  ProgramArguments; without it, it only logs what it would do.
+  Same shape as com.market_maker.fill-ledger.plist (venv python3 directly,
+  logs under basicswap/logs/, not ~/coinswaps).
+
+  Install:   cp com.market_maker.exolix-restock.plist ~/Library/LaunchAgents/ && launchctl load ~/Library/LaunchAgents/com.market_maker.exolix-restock.plist
+  Uninstall: launchctl unload ~/Library/LaunchAgents/com.market_maker.exolix-restock.plist && rm ~/Library/LaunchAgents/com.market_maker.exolix-restock.plist
+  Run now:   launchctl start com.market_maker.exolix-restock
+  Clear a halt (after checking): rm ~/coinswaps/exolix_restock.halt
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.market_maker.exolix-restock</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/evanpavloff/coinswaps/venv/bin/python3</string>
+        <string>-m</string>
+        <string>strategy.exolix_restock</string>
+        <string>--live</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/evanpavloff/Desktop/Claude/market_maker/basicswap</string>
+    <key>StartInterval</key>
+    <integer>900</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/evanpavloff/Desktop/Claude/market_maker/basicswap/logs/exolix_restock.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/evanpavloff/Desktop/Claude/market_maker/basicswap/logs/exolix_restock.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/evanpavloff/coinswaps/venv/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>SWAP_DATADIR</key>
+        <string>/Users/evanpavloff/coinswaps</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>

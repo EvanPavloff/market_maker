@@ -78,6 +78,33 @@ def poll_once(client: BasicSwapClient, conn, config: Config) -> None:
         except (ExternalRateError, OSError, KeyError, ValueError) as e:
             log.warning("get_kraken_xmr_book failed: %s", e)
 
+    # 2026-10-21: real wallet balances, so proof_report.py can score P&L net of
+    # every fee (the fills ledger is gross). Best-effort, like the above.
+    try:
+        snapshot_wallets(client, conn, config, polled_at)
+    except (BasicSwapAPIError, KeyError, TypeError, ValueError) as e:
+        log.warning("wallet snapshot failed: %s", e)
+
+
+def snapshot_wallets(client: BasicSwapClient, conn, config: Config, polled_at: float) -> None:
+    from .live_maker import _TERMINAL_BID_STATES
+
+    tickers = sorted({c for pair in config.pairs for c in pair})
+    wallets = client.get_wallets()
+    balances = {
+        coin_names.to_display_name(t): (float(wallets[t.upper()]["balance"]), float(wallets[t.upper()].get("unconfirmed") or 0))
+        for t in tickers
+    }
+    active = sum(
+        b.get("bid_state") not in _TERMINAL_BID_STATES for b in client.get_bids() + client.get_sent_bids()
+    )
+    active += sum(s["status"] in ("created", "sent") for s in storage.fetch_exolix_swaps(conn))
+    storage.insert_wallet_snapshot(conn, polled_at, balances, active)
+    log.info(
+        "wallets: %s, %d swap(s) in flight",
+        ", ".join(f"{c} {b + u:.8f}" for c, (b, u) in balances.items()), active,
+    )
+
 
 def run(loop: bool) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
