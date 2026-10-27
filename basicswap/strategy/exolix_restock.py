@@ -42,7 +42,6 @@ import logging
 import os
 import re
 import ssl
-import subprocess
 import sys
 import time
 import urllib.error
@@ -52,6 +51,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import external_rates, storage
+from .notify import notify
 from .api_client import BasicSwapAPIError, BasicSwapClient
 from .config import load_config
 from .external_rates import ExternalRateError
@@ -313,11 +313,7 @@ def execute(client: BasicSwapClient, conn, exolix: ExolixClient, cfg: RestockCon
 
 
 def _notify(title: str, message: str) -> None:
-    def esc(s: str) -> str:
-        return s.replace("\\", "\\\\").replace('"', '\\"')
-
-    subprocess.run(["osascript", "-e", f'display notification "{esc(message)}" with title "{esc(title)}"'],
-                   capture_output=True)
+    notify(title, message)
 
 
 def _halt(reason: str) -> int:

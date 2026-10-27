@@ -1,0 +1,15 @@
+# market_maker on the Dell (since 2026-10-27; replaces the Mac's launchd plists).
+# Install: (crontab -l; cat ~/market_maker/basicswap/deploy/dell/crontab.txt) | crontab -
+# Each job runs under flock (no overlap) and timeout (the 09-19 hung-poller lesson),
+# except Exolix: killing it between "created" and "sent" would leave a swap in an unknown state.
+SHELL=/bin/bash
+SWAP_DATADIR=/home/homeserver/coinswaps
+PATH=/home/homeserver/coinswaps/venv/bin:/usr/local/bin:/usr/bin:/bin
+MM=/home/homeserver/market_maker
+@reboot     sleep 60 && $MM/basicswap/deploy/dell/watchdog.sh >> $MM/basicswap/logs/watchdog.log 2>&1
+*/2 * * * * flock -n /tmp/mm-watchdog.lock timeout 120 $MM/basicswap/deploy/dell/watchdog.sh >> $MM/basicswap/logs/watchdog.log 2>&1
+*/5 * * * * cd $MM/basicswap && flock -n /tmp/mm-bsx-poller.lock timeout 240 python3 -m strategy.poller >> logs/poller.log 2>&1
+*/15 * * * * cd $MM/basicswap && flock -n /tmp/mm-exolix.lock bash -c 'set -a; [ -f .env ] && . ./.env; set +a; exec python3 -m strategy.exolix_restock --live' >> logs/exolix_restock.log 2>&1
+7 * * * *   cd $MM/basicswap && flock -n /tmp/mm-ledger.lock timeout 900 python3 -m strategy.fill_ledger >> logs/fill_ledger.log 2>&1
+7 9 * * 3   cd $MM/basicswap && flock -n /tmp/mm-weekly.lock timeout 900 bash -c 'set -a; [ -f .env ] && . ./.env; set +a; exec python3 -m strategy.weekly_status' >> logs/proof_trial_weekly.log 2>&1
+*/5 * * * * cd $MM && flock -n /tmp/mm-venues.lock timeout 240 python3 -m venues.poller >> venues/logs/poller.log 2>&1

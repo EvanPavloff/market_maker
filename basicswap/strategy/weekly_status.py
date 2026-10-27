@@ -19,6 +19,8 @@ import sys
 import urllib.request
 from pathlib import Path
 
+from .notify import notify
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 OUT_DIR = BASE_DIR / "logs" / "proof_trial_weekly"
 NODE_URL = "http://localhost:12700/json"
@@ -45,19 +47,13 @@ def _health_problems() -> list[str]:
         problems.append(f"BasicSwap node not answering ({e.__class__.__name__})")
     ps = subprocess.run(["ps", "-axo", "command="], capture_output=True, text=True)
     loops = [line for line in ps.stdout.splitlines() if "strategy.live_maker" in line and "--loop" in line]
-    if len(loops) != 2:
-        problems.append(f"{len(loops)} live_maker loops running (expected 2)")
+    if len(loops) != 1:  # sell leg only since 2026-10-27 (restock is Exolix)
+        problems.append(f"{len(loops)} live_maker loops running (expected 1)")
     return problems
 
 
 def _notify(title: str, message: str) -> None:
-    def esc(s: str) -> str:
-        return s.replace("\\", "\\\\").replace('"', '\\"')
-
-    subprocess.run(
-        ["osascript", "-e", f'display notification "{esc(message)}" with title "{esc(title)}"'],
-        capture_output=True,
-    )
+    notify(title, message)
 
 
 def main() -> int:
