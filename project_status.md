@@ -1188,3 +1188,19 @@ Nothing from 10-21 is committed (market_maker is its own git repo).
   could bind in a busy week.
 - **After the reboot, still to do:** check `/json/sentoffers` for any old btc->xmr offer of ours
   still active and revoke it.
+
+### Update, 2026-10-27 15:25: migrated to the Dell; trial live again
+- **Copy:** Evan rsynced `~/coinswaps` (126 GB) to the Dell. File counts and byte totals match
+  for monero/bitcoin/particl. Linux binaries came via `basicswap-prepare --preparebinonly`, same
+  versions (Bitcoin 29.4, Monero 0.18.5.1, Particl 27.2.4.0), signatures verified. Mac paths were
+  rewritten in `basicswap.json` and the two monero confs (`*.mac-bak` kept on the Dell).
+- **Verified:** wallets exactly at the 10-23 figures (0.00380609 BTC, 0.98496963 XMR). All 238
+  old offers expired, all 88 bids terminal. Monero caught up ~4 days in ~17 min.
+- **Live:** the watchdog started the sell loop at 15:22, after sync. The offer was posted at
+  15:22:05: 0.55 XMR @ 0.00761021, i.e. 2.1% over mid. The BasicSwap poller, venues poller
+  and Exolix job (`none`, stock fine) all ran from cron.
+- **Not yet:** the Eigen ASB quote binary needs a Linux rebuild (venues poller logs a warning
+  and polls 0). HA push alerts need a token in `basicswap/.env`; until then they only go to the
+  logs. Exolix's occasional 422 is pre-existing (80 on the Mac too), not a Dell issue.
+- **Downtime:** about 10-23 15:00 to 10-27 15:22, ~4 days. Factor it into the 10-28 check and the
+  ~11-04 verdict.

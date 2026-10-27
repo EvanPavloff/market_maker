@@ -12,6 +12,25 @@ launchd job. See `ARCHITECTURE.md` for the framework-level design and gap
 analysis, `project_status.md` for build history, `next_steps.md` for the
 build queue.
 
+## Where it runs (since 2026-10-27): the Dell, not the Mac
+
+The BasicSwap node, wallets and chain data (`~/coinswaps`), the sell-leg `live_maker` loop,
+and every scheduled job run on the HomeServer (`ssh dell`, repo clone at `~/market_maker`).
+They moved because the Mac's external Storage drive dropped out and froze the node twice
+(10-21, 10-23). Edit code on the Mac, push, then `git pull` on the Dell.
+- **Scheduling:** the `homeserver` user's crontab (`basicswap/deploy/dell/crontab.txt`), not launchd.
+  The Mac plists are unloaded and kept only as history.
+- **Watchdog:** `basicswap/deploy/dell/watchdog.sh` runs every 2 min. It starts the node if
+  it's down, starts the sell loop once both wallets are 100% synced, and alerts after 15 min of
+  API silence. Pause it with `touch ~/coinswaps/watchdog.disabled` before any manual
+  node/loop work.
+- **Logs (on the Dell):** `~/market_maker/basicswap/logs/` and `~/market_maker/venues/logs/`.
+  The loop and node logs are in `~/coinswaps/`.
+- **The Mac copy is retired.** `~/coinswaps/basicswap.json` there was renamed
+  `*.MOVED-TO-DELL-2026-10-27` so it can't start. Never run the node on both machines.
+- The checks below were written for the Mac. Run them over `ssh dell`, with `crontab -l` in
+  place of `launchctl list`. Expect 1 `live_maker` process.
+
 ## Session-start checklist — run this before touching anything else here
 
 A hang in this directory has already cost real session time once
