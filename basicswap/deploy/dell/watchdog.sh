@@ -56,6 +56,15 @@ if [ -f "$ALERTED" ]; then alert "BasicSwap node API answering again"; fi
 rm -f "$STATE" "$ALERTED"
 
 if ! pgrep -f "strategy.live_maker .*--coin-from xmr --coin-to btc" >/dev/null; then
-    log "node up, sell loop not running; starting it"
+    # Monero lags after any downtime (~2 blocks/s on 10-27); don't post until both wallets are synced.
+    for coin in xmr btc; do
+        synced=$(curl -s -m 20 "http://localhost:12700/json/wallets/$coin" \
+            | "$PY" -c 'import json,sys; print(json.load(sys.stdin).get("synced"))' 2>/dev/null || true)
+        if [ "$synced" != "100.00" ]; then
+            log "node up, sell loop not running; waiting for $coin wallet sync ($synced%)"
+            exit 0
+        fi
+    done
+    log "node up, wallets synced, sell loop not running; starting it"
     "$REPO/restart_live_maker_btc.sh"
 fi
