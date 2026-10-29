@@ -1606,5 +1606,5 @@ with no change.
 HA_URL=http://127.0.0.1:8123, HA_NOTIFY_SERVICE=mobile_app_evans_iphone (the same service the sensor-health
 alerts use), and HA_TOKEN, copied file-to-file from `~/home_assistant/.env` (the long-lived token made
 for Claude 10-07, never echoed). The watchdog, Exolix cron and weekly job already source this `.env`. A
-test alert was sent 12:37. To use a dedicated token instead: HA profile -> Security -> Long-lived
+test alert was sent at 12:37, and Evan confirmed it arrived on his phone. To use a dedicated token instead: HA profile -> Security -> Long-lived
 access tokens, then replace the HA_TOKEN line.
