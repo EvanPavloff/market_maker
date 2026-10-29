@@ -1204,3 +1204,18 @@ Nothing from 10-21 is committed (market_maker is its own git repo).
   logs. Exolix's occasional 422 is pre-existing (80 on the Mac too), not a Dell issue.
 - **Downtime:** about 10-23 15:00 to 10-27 15:22, ~4 days. Factor it into the 10-28 check and the
   ~11-04 verdict.
+
+### Update, 2026-10-29 11:00: first check-in since the Dell migration (read-only)
+- **Health: good.** Node, 3 daemons and exactly 1 `live_maker` (sell leg) are running; the
+  watchdog hasn't had to restart anything since 10-27 15:22. All cron jobs are current. Disk is 9%
+  used and RAM is fine. There were two brief Dell network blips (DNS 10-28 18:25, unreachable
+  10-29 03:50) that the jobs rode through, plus one `/json/sentoffers` timeout at 10:19.
+- **Trading since the migration:** 3 completed sell fills (10-27 16:50, 10-29 00:41, 01:27) at
+  +1.7–1.9% basis and +0.26/+0.76/+0.94% margin. A 4th (0.52 XMR, 10:00) has settled in the wallet
+  but isn't marked Completed in the ledger yet. 2 more Exolix restocks went through (+0.08%, +0.50%).
+- **proof_report (10-29 10:57):** INCONCLUSIVE, 24 fills (5.8/wk), size-weighted margin +0.17%
+  (was +0.09%). Actual wallet P&L is **+14,260 sats** (was -5,478 on 10-28). Treat that as noisy:
+  it's mostly the last 3 fills, and the wallet is 0.57 XMR short of baseline, valued at spot.
+- **Binding constraint is stock, not edge.** XMR is 0.03 above the 0.385 reserve and Exolix hit its
+  2-swaps-per-24h cap, so the sell offer is down until ~10-30 01:00. The trial-wide "live 40%" also
+  includes the 4-day outage. Still open: HA alert token, and the Eigen ASB Linux binary rebuild.

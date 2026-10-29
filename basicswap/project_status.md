@@ -1551,3 +1551,43 @@ failure mode caught in practice. One Kraken 502 (06:06) was skipped cleanly. No 
 since 10-22 04:09. One restock fill took XMR to the 0.985 target, so the restock leg stood down
 (22:15) and Exolix has idled. proof_report: wallet P&L -8,364 sats (was -13,252), fill-based
 +5,223 sats, still PROVISIONAL INCONCLUSIVE (3.3/4 weeks, sell uptime 36%).
+
+## 2026-10-29, 11:25: 4-week mark, should the trial run another month?
+
+Read from the Dell (the Mac copy is retired, and its `proof_report` reads a stale DB).
+- **Full window** (09-30 onward): INCONCLUSIVE, because cumulative sell uptime was 40% (< 50%).
+  25 fills, size-weighted margin +0.27%. **Actual wallet P&L +15,335 sats** (it was -8,364 on 10-23).
+- **Current config only** (`--since "2026-10-27 15:22"`: Dell runtime, 2.1% premium, 0.15 min bid,
+  floor revoke + 30s guard, Exolix restock, no maker restock leg): PROVISIONAL BASE. 4 fills in
+  2 days, all positive (+0.26% to +1.68%), margin +1.06%, uptime 86%. 2 Exolix swaps at +0.28%.
+  This sample is too small to trust the report's $21k/yr projection.
+- Note: the "Actual wallet P&L" line always uses the 09-30 baseline and ignores `--since`.
+Recommendation given to Evan: yes, run another 4 weeks, with the clock restarted at 10-27 15:22
+and explicit stop rules (see that conversation's answer). Awaiting his call.
+
+## 2026-10-29, 11:45: Dell health check after a suspected reset
+
+Evan thought the Dell had been reset. It wasn't: uptime is 23 days. The node, monerod/bitcoind/particld
+and the one sell `live_maker` loop have all been running since 10-27, and 13 cron entries are
+installed, including the @reboot and */2 watchdog. Wallets are 100% synced (BTC 0.00824361,
+XMR 0.41569268). There's no halt file and no watchdog.disabled, and logs are current to 11:42.
+No sell offer is up, by design: XMR is only 0.031 above the reserve (under one 0.05 step), and
+Exolix is at its 2-swaps-per-24h cap (01:00 and 02:30 today), so the next refill can run
+around 10-30 01:00. The trial-extension plan and stop rules are in `../next_steps.md` #17
+(10-29), awaiting Evan's approval.
+
+## 2026-10-29, ~12:00: Exolix caps reworked (Evan: "implement your suggestions")
+
+Evan asked why Exolix has a limit at all. The answer: Exolix is custodial while a swap is open, and
+it can hold a deposit for documents. So the caps bound (1) how much it holds at once and (2) a
+runaway bug. One swap in flight, 0.004 BTC/swap and the halts do (1). The daily count did almost
+nothing for either, and it kept the sell offer down ~15h on 10-29. The 0.015 BTC/week cap
+would have bound next at ~15 fills/week. Changes in `strategy/exolix_restock.py`:
+- `max_swaps_per_day` 2 -> 6 (runaway backstop).
+- `max_btc_per_week` removed and replaced by `sold_btc_floor = 0.00380609`, the BTC balance at
+  10-27 15:22 when Exolix became the only restock path. A refill is sized to at most the BTC
+  above that line (sale proceeds not yet spent), and is skipped if that buys < 0.2 XMR. A bug can
+  no longer spend the starting stack. **A deposit or withdrawal means editing it.**
+- Unchanged: one in flight, 0.004 BTC/swap, the +1.0% all-in cap, the 60 min cooldown, the halts.
+Note: the fixed ~1,000-sat send fee means a refill under ~0.003 BTC hits the +1.0% cap by itself,
+so a small budget waits for the next sale rather than paying up. 284/284 tests.

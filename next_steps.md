@@ -1590,7 +1590,7 @@ live-capital escalation in this project (the first live offer, the first
 trivial test swap, the volatility kill-switch). Don't redo this build; the
 next action here is a live decision, not more code.
 
-## 17. Accumulate-BTC proof trial + success bar `[BUILT 2026-09-28, trial not started]`
+## 17. Accumulate-BTC proof trial + success bar `[LIVE since 2026-09-30; 4-week extension proposed 2026-10-29]`
 
 **The question the trial answers:** will anyone buy our XMR at a premium often
 enough, and at a good enough price, that restocking it on Kraken would net BTC?
@@ -1649,6 +1649,39 @@ written by the poller) less a baseline and recorded deposits/withdrawals
 -8,364 sats (vs. +5,222 gross), i.e. ~400 sats of fees per fill. On 10-23 the size-weighted
 sell margin was +0.09% over 21 fills (was +0.46% over 19). Still open: the node-health alert,
 and Evan's call on judging by fill count instead of uptime.
+
+**2026-10-22: offer-floor revoke + 30s guard.** A 0.5 XMR sell at 02:14 went -2.75% vs. mid
+(margin -4.26%, roughly 15 typical fills' worth). XMR spiked about 5%, and the kill-switch paused
+repricing but left the stale ask up for six cycles. Evan: "cancel any offer once we determine it
+isn't profitable." Now every cycle revokes a live offer below its floor before any pause, and
+a revoke-only guard re-checks every 30s between cycles. The guard reads Kraken's bid/ask mid
+and applies Kraken's move since the cycle to the cycle's own mid, which avoids flapping on the
+CoinGecko/Kraken gap. Floors: sell +1.0% (`MIN_LIVE_EDGE`, break-even at a 0.15 XMR fill);
+restock cap + reprice tolerance. Repricing stays at 5 min, because repost churn and the
+kill-switch calibration both assume 5-min samples. The guard proved itself on 10-23 00:46,
+pulling a sell offer mid-kill-switch at +0.978%. See `basicswap/project_status.md` 10-22/23.
+
+**2026-10-29, 4-week mark: INCONCLUSIVE on the full window** (sell uptime 40% < 50%, including
+the 10-23 to 10-27 outage before the Dell move). 25 fills, size-weighted margin +0.27%,
+**actual wallet P&L +15,335 sats**. The 4 weeks mostly measured older settings: the premium
+went 1.8% to 2.1%, a min bid, the floor/guard, Exolix restock, the maker restock leg retired,
+and the move to the Dell. **The current config only** (`proof_report --since "2026-10-27 15:22"`):
+PROVISIONAL BASE, 4 fills in 2 days, all positive, margin +1.06%, uptime 86%, Exolix +0.28%.
+Far too few fills to trust the projection.
+
+**Proposed extension (recommended 10-29, AWAITING EVAN'S APPROVAL):** run 4 more weeks,
+scored from **10-27 15:22**.
+- Check-in **11-10**, verdict **11-24**, same bar as the table above.
+- Add a second `capital_flows` baseline at 10-27 15:22 so P&L is measured for this window.
+  The report's "Actual wallet P&L" line always uses the 09-30 baseline and ignores `--since`.
+- **Stop and review if:** wallet P&L since 10-27 falls more than ~10,000 sats; or margin is
+  <= 0 after >= 10 fills; or Exolix halts or holds a deposit for documents.
+- **Known constraint:** stock, not edge. Exolix's 2-swaps-per-24h cap kept the sell offer down
+  from ~10:00 10-29 to ~01:00 10-30, after a fast fill day. **Changed 10-29 on Evan's go-ahead:**
+  the daily count went 2 -> 6 (now a runaway backstop only), and `max_btc_per_week` was replaced by
+  `sold_btc_floor`: Exolix only spends BTC above the 10-27 15:22 balance (0.00380609), i.e. sale
+  proceeds. Kept: one swap in flight, 0.004 BTC/swap, the +1.0% all-in cap, the 60 min cooldown,
+  and the halts. A deposit or withdrawal means editing `sold_btc_floor`.
 
 **Restock side (added 2026-10-02):** `python3 -m venues.restock_cost` from
 `market_maker/` shows the all-in cost to buy 0.5 XMR on each venue we poll

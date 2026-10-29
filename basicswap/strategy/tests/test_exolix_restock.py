@@ -88,13 +88,27 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(p["action"], "skip")
         self.assertIn("24h", p["reason"])
 
-    def test_weekly_btc_cap(self, _):
-        for i in range(4):
-            storage.insert_exolix_swap(self.conn, _row(exolix_id=f"w{i}", status="success", amount_btc=0.0035,
+    def test_no_weekly_cap_past_volume_is_fine(self, _):
+        # 2026-10-29: max_btc_per_week is gone; volume alone no longer blocks a refill.
+        for i in range(5):
+            storage.insert_exolix_swap(self.conn, _row(exolix_id=f"w{i}", status="success", amount_btc=0.0039,
                                                        created_at=NOW - 3 * 86400, updated_at=NOW - 3 * 86400))
-        p = er.plan(_client(), self.conn, _exolix(), CFG, NOW)
+        self.assertEqual(er.plan(_client(), self.conn, _exolix(), CFG, NOW)["action"], "swap")
+
+    def test_refill_spends_only_sale_proceeds_above_the_floor(self, _):
+        # 0.0032 BTC above the floor: a partial refill sized to it, not the full need.
+        # (Much smaller and the fixed ~1,000-sat send fee alone hits the +1% cost cap.)
+        bal = CFG.sold_btc_floor + CFG.network_fee_btc + 0.0032
+        p = er.plan(_client(xmr_balance=0.0, btc_balance=bal), self.conn, _exolix(), CFG, NOW)
+        self.assertEqual(p["action"], "swap")
+        self.assertAlmostEqual(p["amount_btc"], 0.0032, places=8)
+
+    def test_too_little_sale_proceeds_skips(self, _):
+        # 0.001 BTC above the floor buys ~0.14 XMR, under the 0.2 min swap.
+        bal = CFG.sold_btc_floor + CFG.network_fee_btc + 0.001
+        p = er.plan(_client(btc_balance=bal), self.conn, _exolix(), CFG, NOW)
         self.assertEqual(p["action"], "skip")
-        self.assertIn("7 days", p["reason"])
+        self.assertIn("sale proceeds", p["reason"])
 
     def test_cooldown_after_success(self, _):
         storage.insert_exolix_swap(self.conn, _row(status="success", updated_at=NOW - 600))

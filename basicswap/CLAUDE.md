@@ -39,6 +39,11 @@ could matter, and verification.
 tested, and deployed to both live loops the same day (restarted, verified
 running, existing live offer survived untouched). See `../project_status.md`'s
 matching entry for the design, threshold calibration, and restart verification.
+**Changed 2026-10-22:** a pause no longer leaves an *unprofitable* offer up.
+`live_maker._revoke_if_unprofitable` runs every cycle before any pause. The 30s `guard_check`
+runs between cycles (Kraken mid, revoke-only, never posts). A "revoked live offer ... below the
+... floor" log line is the guard working, not a bug. Tunables: `--min-live-edge-pct` (sell,
+script `MIN_LIVE_EDGE=0.01`) and `--guard-interval-seconds` (default 30, <= 0 disables).
 
 **2026-09-20**: opportunistic bid-scanning (`strategy/bid_scanner.py`,
 `next_steps.md` #9) — bidding into OTHER makers' live offers rather than only

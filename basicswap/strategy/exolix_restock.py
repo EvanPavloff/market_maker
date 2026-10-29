@@ -20,9 +20,10 @@ One run (launchd runs it every 15 minutes):
   4. Trigger: XMR above the reserve (balance + unconfirmed) under trigger_xmr.
      Refill to reserve + target_working_xmr. Skips if our own restock offer has a
      swap in flight (XMR already on its way).
-  5. Caps: max_btc_per_swap, max_swaps_per_day, max_btc_per_week. Price: skip if
-     the all-in cost (Exolix float quote + assumed BTC network fee) is more than
-     max_premium_pct over the Kraken mid.
+  5. Caps: max_btc_per_swap, max_swaps_per_day, and sold_btc_floor (refill only
+     with BTC the sell leg has earned; replaced max_btc_per_week 2026-10-29). Price:
+     skip if the all-in cost (Exolix float quote + assumed BTC network fee) is more
+     than max_premium_pct over the Kraken mid.
   6. Live only: create the Exolix exchange, check it echoed our own XMR address
      and gave a plausible BTC deposit address, re-check the price on its quote,
      record the row, THEN send BTC from BasicSwap's wallet.
@@ -87,11 +88,18 @@ class RestockConfig:
     target_working_xmr: float = 0.55    # refill to reserve + this (one full sell offer)
     min_swap_xmr: float = 0.2           # don't bother below this
     max_btc_per_swap: float = 0.004
-    max_swaps_per_day: int = 2
-    max_btc_per_week: float = 0.015
+    # 2026-10-29: was 2. With one swap in flight and the halts, the count adds little
+    # safety, and it kept the sell offer down ~15h after a 4-fill day. Now a runaway backstop.
+    max_swaps_per_day: int = 6
     max_premium_pct: float = 0.010      # all-in, vs. the Kraken mid
     network_fee_btc: float = 0.00001    # assumed ~1,000 sats for the BTC send
     btc_floor: float = 0.0002           # leave at least this in the BTC wallet after sending
+    # 2026-10-29, replaces max_btc_per_week (0.015, which ~15 fills/week would outrun):
+    # refill only with BTC the sell leg has earned. Never send below the BTC balance at
+    # 10-27 15:22, when Exolix became the only restock path (Dell move, maker restock leg
+    # retired); BTC above it is sale proceeds not yet spent on refills, so a bug can't
+    # spend the starting stack. A deposit or withdrawal moves the line: edit this too.
+    sold_btc_floor: float = 0.00380609
     max_source_disagreement_pct: float = 0.015
     max_in_flight_hours: float = 4.0
     cooldown_minutes: float = 60.0
@@ -246,7 +254,6 @@ def plan(client: BasicSwapClient, conn, exolix: ExolixClient, cfg: RestockConfig
     day = [r for r in rows if r["created_at"] >= now - 86400]
     if len(day) >= cfg.max_swaps_per_day:
         return {**info, "action": "skip", "reason": f"{len(day)} swaps in the last 24h (cap {cfg.max_swaps_per_day})"}
-    week_btc = sum(r["amount_btc"] for r in rows if r["status"] != "failed" or r["btc_txid"])
 
     rate = external_rates.get_reference_rate("xmr", "btc")
     if rate.disagreement_pct is not None and rate.disagreement_pct > cfg.max_source_disagreement_pct:
@@ -255,13 +262,14 @@ def plan(client: BasicSwapClient, conn, exolix: ExolixClient, cfg: RestockConfig
     if not mid:
         return {**info, "action": "skip", "reason": "no reference rate"}
 
-    amount_btc = min(round(need_xmr * mid * (1 + cfg.quote_markup), 8), cfg.max_btc_per_swap)
-    if week_btc + amount_btc > cfg.max_btc_per_week:
-        return {**info, "action": "skip",
-                "reason": f"{week_btc:.8f} BTC sent in 7 days + {amount_btc:.8f} > cap {cfg.max_btc_per_week}"}
     btc_balance = float(client.get_wallet("btc")["balance"])
-    if btc_balance - amount_btc - cfg.network_fee_btc < cfg.btc_floor:
-        return {**info, "action": "skip", "reason": f"BTC wallet {btc_balance:.8f} too small for {amount_btc:.8f}"}
+    floor = max(cfg.btc_floor, cfg.sold_btc_floor)
+    budget_btc = round(btc_balance - floor - cfg.network_fee_btc, 8)
+    amount_btc = min(round(need_xmr * mid * (1 + cfg.quote_markup), 8), cfg.max_btc_per_swap, budget_btc)
+    if amount_btc <= 0 or amount_btc / (mid * (1 + cfg.quote_markup)) < cfg.min_swap_xmr:
+        return {**info, "action": "skip",
+                "reason": f"only {max(budget_btc, 0):.8f} BTC of unspent sale proceeds (wallet {btc_balance:.8f}, "
+                          f"floor {floor:.8f}): too little for a {cfg.min_swap_xmr} XMR refill"}
 
     quote = exolix.rate(amount_btc)
     xmr_out = float(quote["toAmount"])
