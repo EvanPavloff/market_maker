@@ -1590,7 +1590,7 @@ live-capital escalation in this project (the first live offer, the first
 trivial test swap, the volatility kill-switch). Don't redo this build; the
 next action here is a live decision, not more code.
 
-## 17. Accumulate-BTC proof trial + success bar `[LIVE since 2026-09-30; 4-week extension proposed 2026-10-29]`
+## 17. Accumulate-BTC proof trial + success bar `[LIVE; extension approved 2026-10-29, scored 10-27 15:22 -> verdict 11-24]`
 
 **The question the trial answers:** will anyone buy our XMR at a premium often
 enough, and at a good enough price, that restocking it on Kraken would net BTC?
@@ -1669,11 +1669,12 @@ and the move to the Dell. **The current config only** (`proof_report --since "20
 PROVISIONAL BASE, 4 fills in 2 days, all positive, margin +1.06%, uptime 86%, Exolix +0.28%.
 Far too few fills to trust the projection.
 
-**Proposed extension (recommended 10-29, AWAITING EVAN'S APPROVAL):** run 4 more weeks,
-scored from **10-27 15:22**.
+**Extension APPROVED by Evan 10-29 and set up on the Dell:** 4 more weeks, scored from **10-27 15:22**.
+`~/coinswaps/proof_trial_start` now holds that time (the old value is in `proof_trial_start.2026-09-30.bak`),
+and `capital_flows` baselines were added at 10-27 15:22 (0.00380609 BTC, 0.98496963 XMR). The report
+uses each coin's latest baseline, so its P&L line now covers this window. The first reading (10-29 12:37)
+was +21,085 sats.
 - Check-in **11-10**, verdict **11-24**, same bar as the table above.
-- Add a second `capital_flows` baseline at 10-27 15:22 so P&L is measured for this window.
-  The report's "Actual wallet P&L" line always uses the 09-30 baseline and ignores `--since`.
 - **Stop and review if:** wallet P&L since 10-27 falls more than ~10,000 sats; or margin is
   <= 0 after >= 10 fills; or Exolix halts or holds a deposit for documents.
 - **Known constraint:** stock, not edge. Exolix's 2-swaps-per-24h cap kept the sell offer down

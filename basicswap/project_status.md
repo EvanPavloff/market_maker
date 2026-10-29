@@ -1591,3 +1591,20 @@ would have bound next at ~15 fills/week. Changes in `strategy/exolix_restock.py`
 - Unchanged: one in flight, 0.004 BTC/swap, the +1.0% all-in cap, the 60 min cooldown, the halts.
 Note: the fixed ~1,000-sat send fee means a refill under ~0.003 BTC hits the +1.0% cap by itself,
 so a small budget waits for the next sale rather than paying up. 284/284 tests.
+
+## 2026-10-29, 12:40: trial extension approved and set up; HA alerts live
+
+**Extension (Evan approved).** Scored from 10-27 15:22: check-in 11-10, verdict 11-24, stop rules in
+`../next_steps.md` #17. On the Dell, `~/coinswaps/proof_trial_start` = 10-27 15:22 (the old value is
+in `proof_trial_start.2026-09-30.bak`). Added `capital_flows` baselines at 10-27 15:22: 0.00380609 BTC,
+0.98496963 XMR. `proof_report` uses each coin's latest baseline, so it now reads this window:
+PROVISIONAL BASE, 4 fills, +1.06% margin, **actual wallet P&L +21,085 sats**. The 12:00 Exolix refill
+(0.003875 BTC -> ~0.523 XMR, +0.25%) had completed by 12:35. The weekly job (Wed 09:07) picks this up
+with no change.
+
+**HA push alerts.** Nothing new was needed in HA. `basicswap/.env` (gitignored, 600) on the Dell sets
+HA_URL=http://127.0.0.1:8123, HA_NOTIFY_SERVICE=mobile_app_evans_iphone (the same service the sensor-health
+alerts use), and HA_TOKEN, copied file-to-file from `~/home_assistant/.env` (the long-lived token made
+for Claude 10-07, never echoed). The watchdog, Exolix cron and weekly job already source this `.env`. A
+test alert was sent 12:37. To use a dedicated token instead: HA profile -> Security -> Long-lived
+access tokens, then replace the HA_TOKEN line.
